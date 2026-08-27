@@ -1,0 +1,5 @@
+node_modules/
+test/node_modules/
+test/bundle.js
+test/*.txt
+*.log
