@@ -1,0 +1,10 @@
+{
+  "name": "inbox-digest-test-harness",
+  "private": true,
+  "description": "Browser-driven verification harness for inbox-digest.jsx (not part of the artifact itself). See test/README.md.",
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0"
+  }
+}
