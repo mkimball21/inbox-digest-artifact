@@ -67,10 +67,19 @@ and a real report fixture in place, as above.
   place with the fetched full text.
 - No page errors during any of the above.
 
-## Summarization failure investigation (2026-08-27 field report: 24/43 failed)
+## Summarization failure investigation (2026-08-27 field report: 24-25/43 failed)
 
-Real-world use against 2026-08-25 showed 24 of 43 summaries as "Summary
-failed to generate." Two things followed from that report:
+Real-world use against 2026-08-25 showed 24-25 of 43 summaries as "Summary
+failed to generate." This took two rounds to actually fix — the first round
+was verified only against a simulation and, correctly, was not trusted as
+"done" until confirmed against the real API. Both rounds are documented
+below since the first round's fixes (error surfacing, calibrated batch
+sizing, broadened retry) are still real and still in the shipped code; the
+second round found and fixed the failure mode that the first round's
+simulation could not have caught, then re-verified everything against the
+real Messages API with real spend, on two different real report files.
+
+### Round 1: batch-sizing / max_tokens (simulation-verified only)
 
 1. **The generic message itself was a bug.** `t.summaryError` was already
    being captured into state on every failure but the JSX never rendered
@@ -151,12 +160,129 @@ failed to generate." Two things followed from that report:
    (needs the same real report fixture as above, dropped in as
    `daily_inbox_report_2026-08-25.txt`).
 
-   **What this does not prove:** that `max_tokens` truncation is the
-   *only* thing that produced the field's 24/43, or the exact wire
-   behavior of a real truncated Anthropic response body under this
-   specific artifact runtime's `mcp_servers`/streaming setup. The
-   estimation-based batch sizing and the truncation-triggered auto-split
-   are both defensive regardless of the exact real number, and the
-   broadened retry covers the rate-limiting hypothesis too — but a live
-   re-test against 2026-08-25 in the actual Claude.ai artifact remains the
-   final confirmation this session can't perform itself.
+   **What this did not prove, and correctly wasn't reported as fixed
+   pending it:** that `max_tokens` truncation was the *only* thing
+   producing the field's 24-25/43, or the exact wire behavior of a real
+   Anthropic response under this app's actual request shape. Confirming
+   that needed the real API.
+
+### Round 2: real API access, real second failure mode, real fix
+
+Given a real (temporary, session-scoped) `ANTHROPIC_API_KEY` for testing
+only — never written to any file, never committed, read once from
+`process.env` — this round ran the **actual, unmodified** summarization
+pipeline (not a hand re-implementation) straight out of `inbox-digest.jsx`
+against the real Messages API. `live-api-lib.mjs` does this by slicing the
+plain-JS section of `inbox-digest.jsx` (the `// Config` block through the
+end of the Gmail-actions section — no JSX, so it's directly `vm`-evaluable
+in Node) at run time on every test run, so these tests can never silently
+drift from the shipped source. A `globalThis.fetch` wrapper attaches the
+real `x-api-key`/`anthropic-version` headers (the shipped app never sets
+these itself — matching the Claude.ai artifact runtime, where auth is
+injected transparently) and logs `stop_reason`/`usage` for every call
+without altering what the app code sends or receives.
+
+**Step 1 — calibration** (`live-calibrate.mjs`): measured real output
+tokens for 47 individual thread summaries, spanning both 2026-08-25 (41
+threads) and a quiet day, 2026-08-01 (6 threads), at a generous
+non-truncating `max_tokens` so the true required length was visible.
+Findings:
+- Real output tokens ranged **71-828**, with p75=386, p90=480, p95=523 —
+  828 was a single outlier.
+- `combinedChars` is a **weak predictor** (Pearson r=0.33): a 32,039-char
+  thread needed only 349 real tokens (mostly unsubscribe/tracking-link
+  boilerplate the model correctly ignored); a compact 1,515-char thread
+  needed 407. Round 1's `chars*0.5/4` formula was consequently wrong in
+  both directions on real data (e.g. estimate=4045 vs. real=349 for the
+  32k-char thread).
+
+`estimateThreadOutputTokens` was recalibrated to a generous flat base
+(600 — comfortably above the observed p95) plus a capped, minor
+char-based adjustment, and `SUMMARY_BATCH_TARGET_OUTPUT_TOKENS` raised to
+900 — not fit tightly to this sample, since batch content varies day to
+day.
+
+**Step 2 — first real-pipeline run, using the recalibrated estimator:**
+`live-verify.mjs` against both real dates came back **40/41 done, 1
+failed** on 2026-08-25 (0 failed on 2026-08-01) — closer to zero, but not
+the zero required, so **not reported as fixed**. The one failure's logged
+`stop_reason` was `end_turn` (the model finished normally — NOT a
+`max_tokens` truncation), so Round 1's fix categorically could not have
+caught it: it was a second, distinct failure mode. Re-sent just that
+thread's prompt via `live-debug-one.mjs` to get the full raw response and
+found it directly: the model wrote a summary that quoted the source text —
+
+> ...the commonly cited "300,000 property management companies" figure...
+
+— without escaping the inner quotes, breaking `JSON.parse` on an
+otherwise complete, well-formed-looking response. This is a fundamentally
+different problem than truncation: asking a model to hand-write raw JSON
+as free text is fragile whenever the content itself contains quotes, no
+matter how much `max_tokens` headroom exists.
+
+**Step 3 — the actual fix:** switched summarization from "ask the model to
+write a JSON array as text" to Anthropic's `tools` (function-calling)
+parameter with a forced `tool_choice` — a mechanism entirely separate
+from `mcp_servers`/H3 (it grants the model no external capability, only a
+local output-format contract; never combined with `mcp_servers` in the
+same request). First attempt used one tool call with an array parameter;
+live-verified that the model sometimes serialized the *array itself* as a
+JSON-encoded string value instead of using the nested-array type,
+reintroducing the same escaping bug one level deeper (still reproduced,
+same quotes). Fixed by flattening the schema to two plain string fields
+(`threadId`, `summary`) called **once per thread** — Claude reliably
+issues multiple tool calls in one turn, confirmed directly by forcing a
+3-thread batch and observing 3 separate `submit_thread_summary` calls
+land. Also hardened `summarizeChunkAdaptive` for a related edge live-found
+while testing this: a multi-thread batch can overflow `max_tokens` after
+*some* (not all) of its per-thread tool calls already landed — confirmed
+directly (a forced batch came back 2-of-3, `stop_reason: max_tokens`, and
+the missing thread is now retried automatically as its own call rather
+than becoming a permanent error — reran the same forced batch and watched
+it happen: first call `max_tokens` (partial), a second automatic call for
+just the missing thread, all 3 done).
+
+**Step 4 — final real-pipeline re-verification, both dates:**
+
+```
+=== 2026-08-25.txt ===  43 threads, 41 need summarizing, 2 skipped (low-text)
+Completed in 206.0s: 41 done, 0 failed (of 41)
+
+=== 2026-08-01.txt ===  7 threads, 6 need summarizing, 1 skipped (low-text)
+Completed in 19.4s: 6 done, 0 failed (of 6)
+
+=== SUMMARY ===
+PASS  2026-08-25.txt: 41/41 summarized, 0 failed, 206.0s
+PASS  2026-08-01.txt: 6/6 summarized, 0 failed, 19.4s
+```
+
+47 real Messages API calls, every one `stop_reason: tool_use` (no
+truncation needed this run) — 0 failures on both dates, against the real
+API, running the real shipped pipeline. This is the result this task
+required before being reported as fixed.
+
+**Rerun it yourself:**
+
+```sh
+ANTHROPIC_API_KEY=sk-ant-... node test/live-calibrate.mjs <report1.txt> [report2.txt ...]   # step 1
+ANTHROPIC_API_KEY=sk-ant-... node test/live-verify.mjs <report1.txt> [report2.txt ...]      # steps 2/4 — the regression gate
+ANTHROPIC_API_KEY=sk-ant-... node test/live-debug-one.mjs <report.txt> <threadId>           # step-2-style single-thread diagnostic
+```
+
+Set `NODE_USE_ENV_PROXY=1` and `NODE_EXTRA_CA_CERTS=/root/.ccr/ca-bundle.crt`
+first if you're behind this environment's egress proxy. `live-verify.mjs`
+exits non-zero if any report has a failure, so it doubles as the
+repeatable regression test for this whole class of bug on any future
+change to the summarization pipeline — point it at any real report file
+you have locally (never commit one; see above).
+
+### On the Round 1 mock-based tests (`harness-summary-*.jsx`, `mockAnthropicFetch.js`, `summary-fix-test.js`, `summary-retry-test.js`)
+
+Left in place as fast, free, deterministic checks of the retry/backoff and
+batch-splitting *mechanics* (e.g. confirming 429/529 injection gets
+absorbed without spending real API calls) — genuinely useful for quick
+iteration. They are **not sufficient on their own** to certify a
+summarization fix, precisely because they simulate the failure mode you
+already hypothesized rather than exercising the real API's actual
+behavior — which is exactly how Round 1 missed the JSON-escaping bug.
+`live-verify.mjs` against a real report file is the authoritative check.

@@ -32,16 +32,16 @@ const DRIVE_FOLDER_ID = "1bZFXxjhcpSSYShN03YSiZbuhBIoqno5C";
 // H4: batches are sized to an ESTIMATED OUTPUT-TOKEN BUDGET (see
 // planSummaryBatches / estimateThreadOutputTokens), not a flat thread count.
 // A flat 5-threads-per-batch looked safe on paper but doesn't hold on real
-// data: at the spec'd 25-50% summary length, a batch of 5 real threads from
-// the 2026-08-25 report needs ~1,400-4,400 estimated output tokens against
-// the fixed max_tokens: 1000 cap, which truncates the model's JSON mid-array
-// and fails every thread in that batch. SUMMARY_BATCH_MAX_THREADS is now
-// only a secondary cap; SUMMARY_BATCH_TARGET_OUTPUT_TOKENS is the real one.
+// data. The estimator itself and this target were both calibrated
+// 2026-08-27 against 47 real single-thread Messages API calls (see the
+// comment above estimateThreadOutputTokens) — real per-thread output
+// topped out at 828 tokens with p95=523, so 900 leaves real headroom under
+// the fixed max_tokens: 1000 cap while still letting more than one small
+// thread share a batch. SUMMARY_BATCH_MAX_THREADS is a secondary cap.
 // Concurrency starts at 3 (not 4) and steps down toward 1 if 429/529
-// responses are observed (H4's "untested" concurrency risk — real, but
-// secondary to the batch-sizing bug above).
+// responses are observed (H4's "untested" concurrency risk).
 const SUMMARY_BATCH_MAX_THREADS = 5;
-const SUMMARY_BATCH_TARGET_OUTPUT_TOKENS = 700; // headroom under the 1000 cap
+const SUMMARY_BATCH_TARGET_OUTPUT_TOKENS = 900; // headroom under the 1000 cap
 const JSON_OVERHEAD_TOKENS_PER_THREAD = 40;
 const SUMMARY_CONCURRENCY_DEFAULT = 3;
 const SUMMARY_CONCURRENCY_MIN = 1;
@@ -294,7 +294,7 @@ function dayScopingLabel(thread) {
 // every extraction here filters explicitly by `type`, never by array index.
 // ---------------------------------------------------------------------------
 
-async function callMessagesAPI({ userText, mcpServers }) {
+async function callMessagesAPI({ userText, mcpServers, tools, toolChoice }) {
   const body = {
     model: MODEL,
     max_tokens: MAX_TOKENS,
@@ -307,6 +307,16 @@ async function callMessagesAPI({ userText, mcpServers }) {
   // any MCP server, Gmail included.
   if (mcpServers && mcpServers.length > 0) {
     body.mcp_servers = mcpServers;
+  }
+  // `tools` here is the ordinary Messages API structured-output mechanism
+  // (a local JSON schema the model fills in) — unrelated to `mcp_servers`
+  // and the H3 hazard. It grants the model no external capability at all,
+  // only a formatting contract for its own reply. Summarization uses it to
+  // get guaranteed-valid JSON back (see summarizeBatchRaw); it is never
+  // combined with mcp_servers in the same request.
+  if (tools) {
+    body.tools = tools;
+    if (toolChoice) body.tool_choice = toolChoice;
   }
 
   const res = await fetch(MESSAGES_API_URL, {

@@ -32,16 +32,16 @@ const DRIVE_FOLDER_ID = "1bZFXxjhcpSSYShN03YSiZbuhBIoqno5C";
 // H4: batches are sized to an ESTIMATED OUTPUT-TOKEN BUDGET (see
 // planSummaryBatches / estimateThreadOutputTokens), not a flat thread count.
 // A flat 5-threads-per-batch looked safe on paper but doesn't hold on real
-// data: at the spec'd 25-50% summary length, a batch of 5 real threads from
-// the 2026-08-25 report needs ~1,400-4,400 estimated output tokens against
-// the fixed max_tokens: 1000 cap, which truncates the model's JSON mid-array
-// and fails every thread in that batch. SUMMARY_BATCH_MAX_THREADS is now
-// only a secondary cap; SUMMARY_BATCH_TARGET_OUTPUT_TOKENS is the real one.
+// data. The estimator itself and this target were both calibrated
+// 2026-08-27 against 47 real single-thread Messages API calls (see the
+// comment above estimateThreadOutputTokens) — real per-thread output
+// topped out at 828 tokens with p95=523, so 900 leaves real headroom under
+// the fixed max_tokens: 1000 cap while still letting more than one small
+// thread share a batch. SUMMARY_BATCH_MAX_THREADS is a secondary cap.
 // Concurrency starts at 3 (not 4) and steps down toward 1 if 429/529
-// responses are observed (H4's "untested" concurrency risk — real, but
-// secondary to the batch-sizing bug above).
+// responses are observed (H4's "untested" concurrency risk).
 const SUMMARY_BATCH_MAX_THREADS = 5;
-const SUMMARY_BATCH_TARGET_OUTPUT_TOKENS = 700; // headroom under the 1000 cap
+const SUMMARY_BATCH_TARGET_OUTPUT_TOKENS = 900; // headroom under the 1000 cap
 const JSON_OVERHEAD_TOKENS_PER_THREAD = 40;
 const SUMMARY_CONCURRENCY_DEFAULT = 3;
 const SUMMARY_CONCURRENCY_MIN = 1;
@@ -294,7 +294,7 @@ function dayScopingLabel(thread) {
 // every extraction here filters explicitly by `type`, never by array index.
 // ---------------------------------------------------------------------------
 
-async function callMessagesAPI({ userText, mcpServers }) {
+async function callMessagesAPI({ userText, mcpServers, tools, toolChoice }) {
   const body = {
     model: MODEL,
     max_tokens: MAX_TOKENS,
@@ -307,6 +307,16 @@ async function callMessagesAPI({ userText, mcpServers }) {
   // any MCP server, Gmail included.
   if (mcpServers && mcpServers.length > 0) {
     body.mcp_servers = mcpServers;
+  }
+  // `tools` here is the ordinary Messages API structured-output mechanism
+  // (a local JSON schema the model fills in) — unrelated to `mcp_servers`
+  // and the H3 hazard. It grants the model no external capability at all,
+  // only a formatting contract for its own reply. Summarization uses it to
+  // get guaranteed-valid JSON back (see summarizeBatchRaw); it is never
+  // combined with mcp_servers in the same request.
+  if (tools) {
+    body.tools = tools;
+    if (toolChoice) body.tool_choice = toolChoice;
   }
 
   const res = await fetch(MESSAGES_API_URL, {
@@ -507,26 +517,82 @@ function buildSummaryPrompt(threadsBatch, { forceShort = false } = {}) {
     "Threads:\n\n" +
     parts.join("\n\n=====\n\n") +
     "\n\n" +
-    'Return ONLY a JSON array, no markdown code fences, no commentary before or after it: [{"threadId": "...", "summary": "..."}, ...]'
+    `Call submit_thread_summary once for each of the ${threadsBatch.length} thread(s) above (${threadsBatch.length} call(s) total), each with that thread's exact threadId.`
   );
 }
+
+// Local structured-output schema for summarization — see the H3 comment on
+// callMessagesAPI's `tools` param. Forcing this tool via tool_choice means
+// the model's reply is generated as a schema-conformant object by the API
+// itself, not hand-typed JSON text — which is what H3's "parse defensively"
+// approach in the original design could not prevent: a real failure seen in
+// live verification (2026-08-27) was a well-formed-looking response that
+// broke JSON.parse because the model quoted a phrase from the source
+// ("...the commonly cited "300,000 property management companies" figure...")
+// without escaping the inner quotes.
+//
+// The schema is deliberately FLAT (two plain string fields) and called once
+// PER THREAD, rather than one call taking an array of {threadId, summary}
+// objects — also live-verified, and for a subtler reason: with an array
+// parameter, the model sometimes serialized the whole array as a JSON
+// string value instead of using the nested-array type, reintroducing the
+// exact same hand-typed-JSON escaping bug one level deeper (still
+// live-reproduced with quotes inside quoted text). Two flat string fields
+// give the model nothing to hand-serialize — Claude can and does call the
+// same tool multiple times in one turn (see the note above
+// summarizeBatchRaw's tool_use extraction), one call per thread.
+const SUMMARY_TOOL = {
+  name: "submit_thread_summary",
+  description: "Submit the digest summary for ONE email thread. Call this once per thread you were given — for N threads, call it N times in this turn.",
+  input_schema: {
+    type: "object",
+    properties: {
+      threadId: { type: "string", description: "The exact threadId this summary is for." },
+      summary: { type: "string", description: "The digest summary text for this thread." },
+    },
+    required: ["threadId", "summary"],
+  },
+};
+const SUMMARY_TOOL_CHOICE = { type: "tool", name: "submit_thread_summary" };
 
 /**
  * Estimates the output tokens one thread's summary will need, so batches can
  * be sized to the fixed max_tokens: 1000 budget (H4) instead of a flat
- * thread count. Verified against the real 2026-08-25 report: several
- * threads (multi-message chains, 5,000-char truncated bodies) need
- * 300-900+ output tokens on their own once the spec'd 25-50% length is
- * applied, so 5 of them together routinely overflow 1000 tokens.
+ * thread count.
  *
- * Estimates off the upper end (50%) of the length range on purpose — sizing
- * to the average case still overflows whenever a batch happens to skew
- * long, which is exactly what real data does.
+ * Calibrated 2026-08-27 against 47 REAL single-thread summary calls to the
+ * live Messages API (not a mock), spanning a busy day (2026-08-25, 41
+ * threads) and a quiet day (2026-08-01, 6 threads), each measured at a
+ * generous non-truncating max_tokens so the true required length was
+ * visible. Findings that shaped this formula:
+ *
+ * - Real output tokens ranged 71-828, with p75=386, p90=480, p95=523 — the
+ *   828 case was a single outlier (a dense newsletter).
+ * - combinedChars is a WEAK predictor (Pearson r=0.33): the largest thread
+ *   in the sample, 32,039 combinedChars, only needed 349 real output
+ *   tokens (most of those chars were unsubscribe links/tracking URLs the
+ *   model correctly ignored), while a compact 1,515-char thread needed
+ *   407. An earlier version of this formula (chars*0.5/4) scaled almost
+ *   entirely off chars and was accordingly wrong in both directions: e.g.
+ *   estimate=4045 vs real=349 for the 32k-char thread (a 12x overestimate
+ *   that forced an unnecessary singleton batch) and estimate=58 vs
+ *   real=102 for a very short one (an underestimate).
+ *
+ * So this is a generous flat base (comfortably above the observed p95),
+ * plus a capped, deliberately minor char-based adjustment — not a tight
+ * fit to this sample's exact shape, since batch content varies day to day.
+ * Any single-thread miss is still caught by summarizeChunkAdaptive's
+ * truncation-triggered split/retry (see below); this formula only needs to
+ * be "usually right," not exact.
  */
+const BASE_OUTPUT_TOKENS_PER_THREAD = 600; // comfortably above the observed p95 (523)
+const CHAR_SCALING_RATE = 0.05; // minor secondary signal — correlation was weak (r=0.33)
+const CHAR_SCALING_CAP = 400; // caps the char contribution so one very long thread doesn't force a needless singleton batch
+
 function estimateThreadOutputTokens(thread) {
   const combinedChars = thread.messages.reduce((sum, m) => sum + (m.lowText ? 0 : m.body.length), 0);
-  const summaryChars = combinedChars * 0.5;
-  return Math.ceil(summaryChars / 4) + JSON_OVERHEAD_TOKENS_PER_THREAD;
+  const charComponent = Math.min(combinedChars * CHAR_SCALING_RATE, CHAR_SCALING_CAP);
+  return Math.ceil(BASE_OUTPUT_TOKENS_PER_THREAD + charComponent) + JSON_OVERHEAD_TOKENS_PER_THREAD;
 }
 
 /**
@@ -556,7 +622,16 @@ function planSummaryBatches(threads) {
   return batches;
 }
 
-/** One batched call per chunk of threads. Never one call per email/thread. */
+/**
+ * One batched call per chunk of threads. Never one call per email/thread.
+ * Uses forced tool-use (SUMMARY_TOOL/SUMMARY_TOOL_CHOICE) rather than
+ * asking the model to hand-write a JSON array as text — see the comment on
+ * SUMMARY_TOOL for why: a live-verified failure (2026-08-27) showed the
+ * model producing well-formed-looking output that still broke JSON.parse
+ * because it quoted source text without escaping the inner quotes.
+ * Structured tool output is generated by the API against a schema and
+ * cannot have that failure mode.
+ */
 async function summarizeBatchRaw(threadsBatch, { forceShort = false } = {}) {
   const data = await callWithRetry(() =>
     callMessagesAPI({
@@ -565,66 +640,82 @@ async function summarizeBatchRaw(threadsBatch, { forceShort = false } = {}) {
       // server — not Gmail, not Drive, nothing. `mcpServers: []` above means
       // `callMessagesAPI` never sets `mcp_servers` on this request at all.
       mcpServers: [],
+      tools: [SUMMARY_TOOL],
+      toolChoice: SUMMARY_TOOL_CHOICE,
     })
   );
-  const raw = blocksByType(data.content, "text")
-    .map((b) => b.text)
-    .join("\n");
-  const parsed = tryParseJsonLoose(raw);
-  if (!Array.isArray(parsed)) {
-    // Surface the actual cause instead of a generic message: whether the
-    // model's own response was cut off at the token cap (stop_reason
-    // "max_tokens" — the real, confirmed cause on real data) or something
-    // else, plus a look at exactly where the text ends so a genuinely new
-    // failure mode is diagnosable from the UI without re-instrumenting.
-    const err = new Error(
-      `Summary response was not valid JSON (stop_reason: ${data.stop_reason || "unknown"}, ` +
-        `response ends: ${JSON.stringify(raw.slice(-200))})`
-    );
-    err.truncated = data.stop_reason === "max_tokens";
-    err.stopReason = data.stop_reason;
-    throw err;
-  }
-  return parsed;
+  // One tool_use block per thread (see the note on SUMMARY_TOOL for why
+  // this is flat/per-thread rather than one call with an array). Each
+  // block's `input.threadId` / `input.summary` are plain strings assembled
+  // by the API's own JSON generation for the call, not hand-typed by the
+  // model as freeform text, so they cannot carry the unescaped-quote bug
+  // that broke the original text-based approach.
+  const toolUseBlocks = blocksByType(data.content, "tool_use").filter((b) => b.name === "submit_thread_summary");
+  const summaries = toolUseBlocks
+    .filter((b) => b.input && typeof b.input.threadId === "string" && typeof b.input.summary === "string")
+    .map((b) => ({ threadId: b.input.threadId, summary: b.input.summary }));
+
+  // Deliberately never throws for "fewer summaries than threads requested"
+  // — including zero. A multi-thread batch can overflow max_tokens after
+  // some (not all) of its per-thread tool calls already landed
+  // (live-verified: 2 of 3 came back before stop_reason: "max_tokens" cut
+  // the 3rd short); the caller needs to know which threadIds are actually
+  // missing and whether it was budget-related, not just get an exception.
+  return { summaries, truncated: data.stop_reason === "max_tokens", stopReason: data.stop_reason, rawContent: data.content };
 }
 
 /**
- * Summarizes one batch, recovering from max_tokens truncation by splitting
- * the batch and retrying the halves — a batch that overflowed max_tokens
- * once will overflow again unchanged, so a plain retry can't fix it, only a
- * smaller batch can. Bottoms out at a single thread; if even one thread's
- * own summary overflows, retries once more asking for a best-effort
- * shortened summary instead of splitting further (there's nothing smaller
- * to split into). Returns { sawRateLimit } so the caller can step down
- * concurrency across rounds (H4).
+ * Summarizes one batch. Any threadId missing from the result (including a
+ * fully-empty result) is retried — as a half-split if the WHOLE batch
+ * overflowed max_tokens with nothing back (a batch that overflowed once
+ * will overflow again unchanged, so only a smaller batch fixes it); as a
+ * same-size retry of just the missing subset, bounded by `retriesLeft`,
+ * for a partial miss (some threads' calls landed before the budget ran
+ * out) or a non-truncated miss (the model simply skipped a thread). A
+ * single thread that overflows on its own gets one retry asking for a
+ * best-effort shortened summary instead of splitting further. Returns
+ * { sawRateLimit } so the caller can step down concurrency across rounds
+ * (H4).
  */
-async function summarizeChunkAdaptive(threadsBatch, onThreadDone, forceShort = false) {
+async function summarizeChunkAdaptive(threadsBatch, onThreadDone, opts = {}) {
+  const { forceShort = false, retriesLeft = 2 } = opts;
   try {
-    const parsed = await summarizeBatchRaw(threadsBatch, { forceShort });
-    const byId = new Map(parsed.map((p) => [p.threadId, p.summary]));
+    const { summaries, truncated } = await summarizeBatchRaw(threadsBatch, { forceShort });
+    const byId = new Map(summaries.map((p) => [p.threadId, p.summary]));
     threadsBatch.forEach((t) => {
-      const summary = byId.get(t.threadId);
-      onThreadDone(
-        t.threadId,
-        summary
-          ? { status: "done", summary }
-          : { status: "error", error: `Thread ${t.threadId} was not present in the summary response.` }
-      );
+      if (byId.has(t.threadId)) onThreadDone(t.threadId, { status: "done", summary: byId.get(t.threadId) });
     });
-    return { sawRateLimit: false };
-  } catch (err) {
-    if (err.truncated && threadsBatch.length > 1) {
+    const missing = threadsBatch.filter((t) => !byId.has(t.threadId));
+    if (missing.length === 0) return { sawRateLimit: false };
+
+    if (truncated && missing.length === threadsBatch.length && threadsBatch.length > 1) {
       const mid = Math.ceil(threadsBatch.length / 2);
       const [a, b] = await Promise.all([
-        summarizeChunkAdaptive(threadsBatch.slice(0, mid), onThreadDone),
-        summarizeChunkAdaptive(threadsBatch.slice(mid), onThreadDone),
+        summarizeChunkAdaptive(threadsBatch.slice(0, mid), onThreadDone, { forceShort }),
+        summarizeChunkAdaptive(threadsBatch.slice(mid), onThreadDone, { forceShort }),
       ]);
       return { sawRateLimit: a.sawRateLimit || b.sawRateLimit };
     }
-    if (err.truncated && threadsBatch.length === 1 && !forceShort) {
-      return summarizeChunkAdaptive(threadsBatch, onThreadDone, true);
+    if (truncated && threadsBatch.length === 1 && !forceShort) {
+      return summarizeChunkAdaptive(threadsBatch, onThreadDone, { forceShort: true, retriesLeft });
     }
+    if (retriesLeft > 0) {
+      return summarizeChunkAdaptive(missing, onThreadDone, { forceShort, retriesLeft: retriesLeft - 1 });
+    }
+    missing.forEach((t) =>
+      onThreadDone(t.threadId, {
+        status: "error",
+        error: `Thread ${t.threadId} was not present in the summary response after retries (stop_reason: ${truncated ? "max_tokens" : "other"}).`,
+      })
+    );
+    return { sawRateLimit: false };
+  } catch (err) {
+    // callMessagesAPI/callWithRetry throw here only for real HTTP/network
+    // failures — summarizeBatchRaw itself never throws (see above).
     const sawRateLimit = err.status === 429 || err.status === 529;
+    if (retriesLeft > 0) {
+      return summarizeChunkAdaptive(threadsBatch, onThreadDone, { forceShort, retriesLeft: retriesLeft - 1 });
+    }
     threadsBatch.forEach((t) => onThreadDone(t.threadId, { status: "error", error: String(err.message || err) }));
     return { sawRateLimit };
   }
