@@ -49,7 +49,7 @@ model exactly which tool to call and with what arguments; the actual data
 comes back in `mcp_tool_result` content blocks, which are extracted by
 `type`, never by array position.
 
-- **H3 (prompt injection):** summarization calls (`summarizeBatch`) pass
+- **H3 (prompt injection):** summarization calls (`summarizeBatchRaw`) pass
   `mcpServers: []`. `callMessagesAPI` only ever sets the request's
   `mcp_servers` key when a non-empty array is passed in — so a
   summarization request never carries `mcp_servers` at all, Gmail included.
@@ -57,10 +57,20 @@ comes back in `mcp_tool_result` content blocks, which are extracted by
   see the comments at both call sites in `inbox-digest.jsx`. Every Gmail
   action prompt (`buildGmailActionPrompt`) interpolates only message IDs and
   the fixed tool/labelIds constants — never a subject, sender, or body.
-- **H4 (batching/concurrency):** summaries are requested in batches of 5
-  threads, run 4-way concurrent by default, falling back to 2-way if a 429
-  is observed on any call in a round. Low-text placeholder bodies are
-  skipped client-side before ever reaching a summarization call.
+- **H4 (batching/concurrency):** batches are sized to an *estimated
+  output-token budget* (`planSummaryBatches`/`estimateThreadOutputTokens`),
+  not a flat thread count — a flat 5-per-batch overflowed the fixed
+  `max_tokens: 1000` on real data (see "Summarization failure
+  investigation" in `test/README.md`) and produced truncated, unparseable
+  JSON. A batch that comes back truncated (`stop_reason: "max_tokens"`) is
+  automatically split in half and retried, since retrying an oversized
+  batch unchanged just truncates again. Concurrency starts at 3 (not 4)
+  and steps down toward 1 if 429/529 is observed; `callWithRetry` retries
+  429/500/502/503/529 and network errors with jittered backoff. Low-text
+  placeholder bodies are skipped client-side before ever reaching a
+  summarization call. A failed summary's card shows the actual captured
+  error (status/body, or the parse diagnostic including `stop_reason`),
+  not just "failed to generate."
 - **H5 (navigation):** all jump links use React refs + `scrollIntoView`,
   never hash anchors. Verified in both directions — see `test/README.md`.
 - **H6 (bulk Gmail actions):** message IDs for every action are filtered

@@ -391,16 +391,16 @@ function extractMcpToolResultJson(content, toolName) {
 // Drive fetch (section 2)
 // ---------------------------------------------------------------------------
 
-window.__test = window.__test || { fetchReportCalls: 0, gmailActionCalls: [], summarizeCalls: 0 };
+window.__test = window.__test || { fetchReportCalls: 0, gmailActionCalls: [] };
 
 async function fetchAvailableDates() {
-  return ["2026-08-25", "2026-08-24"];
+  return ["2026-08-25"];
 }
 
 async function fetchReportForDate(date) {
   window.__test.fetchReportCalls++;
   if (date !== "2026-08-25") return null;
-  const res = await fetch("/daily_inbox_report_2026-08-25.txt");
+  const res = await window.__realFetch("/daily_inbox_report_2026-08-25.txt");
   return res.text();
 }
 
@@ -408,14 +408,183 @@ async function fetchReportForDate(date) {
 // Summarization (section 4; H3, H4)
 // ---------------------------------------------------------------------------
 
-async function summarizeAllThreads(threads, onThreadDone) {
-  window.__test.summarizeCalls++;
+function buildSummaryPrompt(threadsBatch, { forceShort = false } = {}) {
+  const parts = threadsBatch.map((t) => {
+    const bodyText = t.messages
+      .map(
+        (m, mi) =>
+          `Message ${mi + 1} of ${t.messages.length}${m.truncated ? " (TRUNCATED at 5000 characters)" : ""} — from ${m.fromDisplay} at ${m.timestampFull}:\n${m.body}`
+      )
+      .join("\n---\n");
+    return `Thread (threadId: ${t.threadId}, subject: "${t.subject}"):\n${bodyText}`;
+  });
+
+  // forceShort is only used for a single-thread retry after that thread's
+  // own summary alone overflowed the output budget (see
+  // summarizeChunkAdaptive) — there's nothing left to split at that point,
+  // so the ask changes from "25-50%" to "as much as fits."
+  const lengthInstruction = forceShort
+    ? '- This thread\'s full source is too long to summarize at 25-50% length within the available space — instead write the most complete, useful summary that fits, and end it with the exact text "[summary shortened due to length]".'
+    : "- Is roughly 25-50% of that thread's combined source length by word count — a short source gets a short summary, a long/dense source gets a longer one. Do not pad short emails or force long ones down to a uniform length.";
+
+  return (
+    "You are writing digest summaries of email threads for someone who will read ONLY your summary, never the original. " +
+    "For EACH thread below, write a summary that:\n" +
+    "- Replaces the need to read the original: include concrete details, figures, actions, and deadlines explicitly.\n" +
+    "- Covers every message in the thread, not just the first.\n" +
+    "- Explicitly notes if any message in the thread was truncated at 5,000 characters.\n" +
+    lengthInstruction +
+    "\n" +
+    "- Never invents content that is not in the source.\n\n" +
+    "Threads:\n\n" +
+    parts.join("\n\n=====\n\n") +
+    "\n\n" +
+    'Return ONLY a JSON array, no markdown code fences, no commentary before or after it: [{"threadId": "...", "summary": "..."}, ...]'
+  );
+}
+
+/**
+ * Estimates the output tokens one thread's summary will need, so batches can
+ * be sized to the fixed max_tokens: 1000 budget (H4) instead of a flat
+ * thread count. Verified against the real 2026-08-25 report: several
+ * threads (multi-message chains, 5,000-char truncated bodies) need
+ * 300-900+ output tokens on their own once the spec'd 25-50% length is
+ * applied, so 5 of them together routinely overflow 1000 tokens.
+ *
+ * Estimates off the upper end (50%) of the length range on purpose — sizing
+ * to the average case still overflows whenever a batch happens to skew
+ * long, which is exactly what real data does.
+ */
+function estimateThreadOutputTokens(thread) {
+  const combinedChars = thread.messages.reduce((sum, m) => sum + (m.lowText ? 0 : m.body.length), 0);
+  const summaryChars = combinedChars * 0.5;
+  return Math.ceil(summaryChars / 4) + JSON_OVERHEAD_TOKENS_PER_THREAD;
+}
+
+/**
+ * Builds variable-size batches bounded by SUMMARY_BATCH_TARGET_OUTPUT_TOKENS
+ * (primary bound) and SUMMARY_BATCH_MAX_THREADS (secondary bound), instead
+ * of a flat SUMMARY_BATCH_SIZE. This is the actual fix for the max_tokens
+ * truncation bug — see the comment above estimateThreadOutputTokens.
+ */
+function planSummaryBatches(threads) {
+  const batches = [];
+  let current = [];
+  let currentEstTokens = 0;
+
   for (const t of threads) {
-    await new Promise((r) => setTimeout(r, 5));
-    onThreadDone(t.threadId, {
-      status: "done",
-      summary: `[test summary] ${t.messages.length} message(s), subject "${t.subject}".`,
+    const est = estimateThreadOutputTokens(t);
+    const wouldOverflow = currentEstTokens + est > SUMMARY_BATCH_TARGET_OUTPUT_TOKENS;
+    const atCountLimit = current.length >= SUMMARY_BATCH_MAX_THREADS;
+    if (current.length > 0 && (wouldOverflow || atCountLimit)) {
+      batches.push(current);
+      current = [];
+      currentEstTokens = 0;
+    }
+    current.push(t);
+    currentEstTokens += est;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+/** One batched call per chunk of threads. Never one call per email/thread. */
+async function summarizeBatchRaw(threadsBatch, { forceShort = false } = {}) {
+  const data = await callWithRetry(() =>
+    callMessagesAPI({
+      userText: buildSummaryPrompt(threadsBatch, { forceShort }),
+      // H3, hard architectural rule: summarization calls attach NO MCP
+      // server — not Gmail, not Drive, nothing. `mcpServers: []` above means
+      // `callMessagesAPI` never sets `mcp_servers` on this request at all.
+      mcpServers: [],
+    })
+  );
+  const raw = blocksByType(data.content, "text")
+    .map((b) => b.text)
+    .join("\n");
+  const parsed = tryParseJsonLoose(raw);
+  if (!Array.isArray(parsed)) {
+    // Surface the actual cause instead of a generic message: whether the
+    // model's own response was cut off at the token cap (stop_reason
+    // "max_tokens" — the real, confirmed cause on real data) or something
+    // else, plus a look at exactly where the text ends so a genuinely new
+    // failure mode is diagnosable from the UI without re-instrumenting.
+    const err = new Error(
+      `Summary response was not valid JSON (stop_reason: ${data.stop_reason || "unknown"}, ` +
+        `response ends: ${JSON.stringify(raw.slice(-200))})`
+    );
+    err.truncated = data.stop_reason === "max_tokens";
+    err.stopReason = data.stop_reason;
+    throw err;
+  }
+  return parsed;
+}
+
+/**
+ * Summarizes one batch, recovering from max_tokens truncation by splitting
+ * the batch and retrying the halves — a batch that overflowed max_tokens
+ * once will overflow again unchanged, so a plain retry can't fix it, only a
+ * smaller batch can. Bottoms out at a single thread; if even one thread's
+ * own summary overflows, retries once more asking for a best-effort
+ * shortened summary instead of splitting further (there's nothing smaller
+ * to split into). Returns { sawRateLimit } so the caller can step down
+ * concurrency across rounds (H4).
+ */
+async function summarizeChunkAdaptive(threadsBatch, onThreadDone, forceShort = false) {
+  try {
+    const parsed = await summarizeBatchRaw(threadsBatch, { forceShort });
+    const byId = new Map(parsed.map((p) => [p.threadId, p.summary]));
+    threadsBatch.forEach((t) => {
+      const summary = byId.get(t.threadId);
+      onThreadDone(
+        t.threadId,
+        summary
+          ? { status: "done", summary }
+          : { status: "error", error: `Thread ${t.threadId} was not present in the summary response.` }
+      );
     });
+    return { sawRateLimit: false };
+  } catch (err) {
+    if (err.truncated && threadsBatch.length > 1) {
+      const mid = Math.ceil(threadsBatch.length / 2);
+      const [a, b] = await Promise.all([
+        summarizeChunkAdaptive(threadsBatch.slice(0, mid), onThreadDone),
+        summarizeChunkAdaptive(threadsBatch.slice(mid), onThreadDone),
+      ]);
+      return { sawRateLimit: a.sawRateLimit || b.sawRateLimit };
+    }
+    if (err.truncated && threadsBatch.length === 1 && !forceShort) {
+      return summarizeChunkAdaptive(threadsBatch, onThreadDone, true);
+    }
+    const sawRateLimit = err.status === 429 || err.status === 529;
+    threadsBatch.forEach((t) => onThreadDone(t.threadId, { status: "error", error: String(err.message || err) }));
+    return { sawRateLimit };
+  }
+}
+
+/**
+ * Summarizes `threads` (already filtered to those needing it) in batches
+ * planned by planSummaryBatches, running batches concurrently (H4) and
+ * streaming each thread's result in via onThreadDone as soon as its batch
+ * resolves — never blocking the whole view on the full set. Steps
+ * concurrency down toward SUMMARY_CONCURRENCY_MIN, one step per round, if
+ * 429/529 responses are observed.
+ */
+async function summarizeAllThreads(threads, onThreadDone) {
+  const chunks = planSummaryBatches(threads);
+
+  let concurrency = SUMMARY_CONCURRENCY_DEFAULT;
+  let cursor = 0;
+
+  while (cursor < chunks.length) {
+    const round = chunks.slice(cursor, cursor + concurrency);
+    const results = await Promise.all(round.map((chunk) => summarizeChunkAdaptive(chunk, onThreadDone)));
+    const sawRateLimit = results.some((r) => r.sawRateLimit);
+
+    if (sawRateLimit && concurrency > SUMMARY_CONCURRENCY_MIN) {
+      concurrency -= 1;
+    }
+    cursor += round.length;
   }
 }
 
@@ -443,12 +612,10 @@ function buildGmailActionPrompt(tool, labelIds, messageIds) {
  */
 async function runGmailLabelAction(actionKey, messageIds) {
   window.__test.gmailActionCalls.push({ actionKey, messageIds: [...messageIds] });
-  await new Promise((r) => setTimeout(r, 5));
   return { succeeded: new Set(messageIds), failed: new Set() };
 }
 
 async function fetchFullBody(messageId) {
-  await new Promise((r) => setTimeout(r, 5));
   return `[test full body for ${messageId}] `.repeat(50);
 }
 

@@ -29,23 +29,11 @@ const MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS = 1000;
 const DRIVE_FOLDER_ID = "1bZFXxjhcpSSYShN03YSiZbuhBIoqno5C";
 
-// H4: batches are sized to an ESTIMATED OUTPUT-TOKEN BUDGET (see
-// planSummaryBatches / estimateThreadOutputTokens), not a flat thread count.
-// A flat 5-threads-per-batch looked safe on paper but doesn't hold on real
-// data: at the spec'd 25-50% summary length, a batch of 5 real threads from
-// the 2026-08-25 report needs ~1,400-4,400 estimated output tokens against
-// the fixed max_tokens: 1000 cap, which truncates the model's JSON mid-array
-// and fails every thread in that batch. SUMMARY_BATCH_MAX_THREADS is now
-// only a secondary cap; SUMMARY_BATCH_TARGET_OUTPUT_TOKENS is the real one.
-// Concurrency starts at 3 (not 4) and steps down toward 1 if 429/529
-// responses are observed (H4's "untested" concurrency risk — real, but
-// secondary to the batch-sizing bug above).
-const SUMMARY_BATCH_MAX_THREADS = 5;
-const SUMMARY_BATCH_TARGET_OUTPUT_TOKENS = 700; // headroom under the 1000 cap
-const JSON_OVERHEAD_TOKENS_PER_THREAD = 40;
-const SUMMARY_CONCURRENCY_DEFAULT = 3;
-const SUMMARY_CONCURRENCY_MIN = 1;
-const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 529]);
+// H4: expect ~4-5 threads per summarization call, 4-way concurrency by
+// default, falling back to 2-way if a 429 is observed.
+const SUMMARY_BATCH_SIZE = 5;
+const SUMMARY_CONCURRENCY_DEFAULT = 4;
+const SUMMARY_CONCURRENCY_FALLBACK = 2;
 
 // H6: chunk bulk Gmail actions into small batches with mechanically-supplied
 // IDs rather than one call per message or one giant call.
@@ -334,15 +322,9 @@ async function callWithRetry(fn, { retries = 3, baseDelayMs = 800 } = {}) {
     try {
       return await fn();
     } catch (err) {
-      const status = err && err.status;
-      const isRetryableHttp = status !== undefined && RETRYABLE_STATUS_CODES.has(status);
-      // A network-level fetch failure (dropped connection, transient DNS/TLS
-      // hiccup) rejects with a plain TypeError and no .status — that's just
-      // as transient as a 429/5xx and deserves the same retry treatment.
-      const isNetworkError = !status && err instanceof TypeError;
-      if (!(isRetryableHttp || isNetworkError) || attempt >= retries) throw err;
-      const jitter = Math.random() * 200;
-      const delay = baseDelayMs * Math.pow(2, attempt) + jitter;
+      const isRateLimited = err && err.status === 429;
+      if (!isRateLimited || attempt >= retries) throw err;
+      const delay = baseDelayMs * Math.pow(2, attempt);
       await new Promise((resolve) => setTimeout(resolve, delay));
       attempt++;
     }
@@ -391,16 +373,16 @@ function extractMcpToolResultJson(content, toolName) {
 // Drive fetch (section 2)
 // ---------------------------------------------------------------------------
 
-window.__test = window.__test || { fetchReportCalls: 0, gmailActionCalls: [], summarizeCalls: 0 };
+window.__test = window.__test || { fetchReportCalls: 0, gmailActionCalls: [] };
 
 async function fetchAvailableDates() {
-  return ["2026-08-25", "2026-08-24"];
+  return ["2026-08-25"];
 }
 
 async function fetchReportForDate(date) {
   window.__test.fetchReportCalls++;
   if (date !== "2026-08-25") return null;
-  const res = await fetch("/daily_inbox_report_2026-08-25.txt");
+  const res = await window.__realFetch("/daily_inbox_report_2026-08-25.txt");
   return res.text();
 }
 
@@ -408,14 +390,99 @@ async function fetchReportForDate(date) {
 // Summarization (section 4; H3, H4)
 // ---------------------------------------------------------------------------
 
+function buildSummaryPrompt(threadsBatch) {
+  const parts = threadsBatch.map((t) => {
+    const bodyText = t.messages
+      .map(
+        (m, mi) =>
+          `Message ${mi + 1} of ${t.messages.length}${m.truncated ? " (TRUNCATED at 5000 characters)" : ""} — from ${m.fromDisplay} at ${m.timestampFull}:\n${m.body}`
+      )
+      .join("\n---\n");
+    return `Thread (threadId: ${t.threadId}, subject: "${t.subject}"):\n${bodyText}`;
+  });
+
+  return (
+    "You are writing digest summaries of email threads for someone who will read ONLY your summary, never the original. " +
+    "For EACH thread below, write a summary that:\n" +
+    "- Replaces the need to read the original: include concrete details, figures, actions, and deadlines explicitly.\n" +
+    "- Covers every message in the thread, not just the first.\n" +
+    "- Explicitly notes if any message in the thread was truncated at 5,000 characters.\n" +
+    "- Is roughly 25-50% of that thread's combined source length by word count — a short source gets a short summary, a long/dense source gets a longer one. Do not pad short emails or force long ones down to a uniform length.\n" +
+    "- Never invents content that is not in the source.\n\n" +
+    "Threads:\n\n" +
+    parts.join("\n\n=====\n\n") +
+    "\n\n" +
+    'Return ONLY a JSON array, no markdown code fences, no commentary before or after it: [{"threadId": "...", "summary": "..."}, ...]'
+  );
+}
+
+/** One batched call per chunk of threads. Never one call per email/thread. */
+async function summarizeBatch(threadsBatch) {
+  const data = await callWithRetry(() =>
+    callMessagesAPI({
+      userText: buildSummaryPrompt(threadsBatch),
+      // H3, hard architectural rule: summarization calls attach NO MCP
+      // server — not Gmail, not Drive, nothing. `mcpServers: []` above means
+      // `callMessagesAPI` never sets `mcp_servers` on this request at all.
+      mcpServers: [],
+    })
+  );
+  const raw = blocksByType(data.content, "text")
+    .map((b) => b.text)
+    .join("\n");
+  const parsed = tryParseJsonLoose(raw);
+  if (!Array.isArray(parsed)) throw new Error("Summary response was not a JSON array");
+  return parsed;
+}
+
+/**
+ * Summarizes `threads` (already filtered to those needing it) in batches of
+ * SUMMARY_BATCH_SIZE, running batches concurrently (H4) and streaming each
+ * thread's result in via onThreadDone as soon as its batch resolves — never
+ * blocking the whole view on the full set. Falls back to a smaller
+ * concurrency window if a 429 is observed (untested assumption per H4).
+ */
 async function summarizeAllThreads(threads, onThreadDone) {
-  window.__test.summarizeCalls++;
-  for (const t of threads) {
-    await new Promise((r) => setTimeout(r, 5));
-    onThreadDone(t.threadId, {
-      status: "done",
-      summary: `[test summary] ${t.messages.length} message(s), subject "${t.subject}".`,
+  const chunks = [];
+  for (let i = 0; i < threads.length; i += SUMMARY_BATCH_SIZE) {
+    chunks.push(threads.slice(i, i + SUMMARY_BATCH_SIZE));
+  }
+
+  let concurrency = SUMMARY_CONCURRENCY_DEFAULT;
+  let cursor = 0;
+
+  while (cursor < chunks.length) {
+    const round = chunks.slice(cursor, cursor + concurrency);
+    const settled = await Promise.allSettled(
+      round.map((chunk) => summarizeBatch(chunk).then((parsed) => ({ chunk, parsed })))
+    );
+
+    let sawRateLimit = false;
+    settled.forEach((result, idx) => {
+      const chunk = round[idx];
+      if (result.status === "fulfilled") {
+        const byId = new Map(result.value.parsed.map((p) => [p.threadId, p.summary]));
+        chunk.forEach((t) => {
+          const summary = byId.get(t.threadId);
+          onThreadDone(
+            t.threadId,
+            summary
+              ? { status: "done", summary }
+              : { status: "error", error: "Thread missing from summary response" }
+          );
+        });
+      } else {
+        if (result.reason && result.reason.status === 429) sawRateLimit = true;
+        chunk.forEach((t) =>
+          onThreadDone(t.threadId, { status: "error", error: String((result.reason && result.reason.message) || result.reason) })
+        );
+      }
     });
+
+    if (sawRateLimit && concurrency > SUMMARY_CONCURRENCY_FALLBACK) {
+      concurrency = SUMMARY_CONCURRENCY_FALLBACK;
+    }
+    cursor += round.length;
   }
 }
 
@@ -443,12 +510,10 @@ function buildGmailActionPrompt(tool, labelIds, messageIds) {
  */
 async function runGmailLabelAction(actionKey, messageIds) {
   window.__test.gmailActionCalls.push({ actionKey, messageIds: [...messageIds] });
-  await new Promise((r) => setTimeout(r, 5));
   return { succeeded: new Set(messageIds), failed: new Set() };
 }
 
 async function fetchFullBody(messageId) {
-  await new Promise((r) => setTimeout(r, 5));
   return `[test full body for ${messageId}] `.repeat(50);
 }
 
@@ -984,22 +1049,12 @@ export default function InboxDigest() {
                           </p>
                         )}
                         {t.summaryStatus === "error" && (
-                          <div>
-                            <p style={{ color: "#8B3A3A" }}>
-                              Summary failed to generate.{" "}
-                              <span className="digest-link" onClick={() => handleRetrySummary(t)}>
-                                Retry
-                              </span>
-                            </p>
-                            {t.summaryError && (
-                              <p
-                                className="digest-mono"
-                                style={{ color: COLORS.textSecondary, fontSize: "0.75rem", marginTop: "0.25rem" }}
-                              >
-                                {t.summaryError}
-                              </p>
-                            )}
-                          </div>
+                          <p style={{ color: "#8B3A3A" }}>
+                            Summary failed to generate.{" "}
+                            <span className="digest-link" onClick={() => handleRetrySummary(t)}>
+                              Retry
+                            </span>
+                          </p>
                         )}
                         {t.summaryStatus === "done" && <p style={{ lineHeight: 1.5 }}>{t.summary}</p>}
                       </div>

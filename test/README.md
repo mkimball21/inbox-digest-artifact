@@ -66,3 +66,97 @@ and a real report fixture in place, as above.
 - Clicking "load full email" on a truncated message replaced its body in
   place with the fetched full text.
 - No page errors during any of the above.
+
+## Summarization failure investigation (2026-08-27 field report: 24/43 failed)
+
+Real-world use against 2026-08-25 showed 24 of 43 summaries as "Summary
+failed to generate." Two things followed from that report:
+
+1. **The generic message itself was a bug.** `t.summaryError` was already
+   being captured into state on every failure but the JSX never rendered
+   it — the detailed cause (HTTP status/body, or a JSON-parse diagnostic)
+   existed the whole time and was just never shown. Fixed: the error text
+   now renders (mono, small) under "Summary failed to generate."
+
+2. **The likely root cause, quantified against the real report before
+   writing any fix code:** the original `SUMMARY_BATCH_SIZE = 5` batches 5
+   threads per call at the spec'd 25-50%-of-source summary length, but
+   `max_tokens` is fixed at 1000 (Technical constraints). Estimating real
+   output tokens per thread from the actual 2026-08-25 body lengths (at the
+   *midpoint* of the 25-50% range) put **8 of the 9 batches at
+   ~1,400-4,400 estimated output tokens** — 1.4x to 4.4x over budget. That
+   points to `max_tokens` truncation producing invalid/incomplete JSON
+   (which fails every thread in that batch at once), not primarily rate
+   limiting, though H4 already flagged concurrency as a secondary,
+   untested risk worth hardening regardless.
+
+   `inbox-digest.jsx` was then changed to: size batches by an estimated
+   output-token budget instead of a flat thread count
+   (`planSummaryBatches`/`estimateThreadOutputTokens`); detect a
+   `stop_reason: "max_tokens"` truncation and automatically split the
+   batch in half and retry (a batch that overflowed once will overflow
+   again unchanged — only a smaller batch fixes it, not a retry); broaden
+   `callWithRetry` beyond 429 to 500/502/503/529 and network errors, with
+   jitter; and drop default concurrency from 4 to 3, stepping toward 1.
+
+   This session has no Anthropic API key available to it (confirmed: a
+   direct call to the real Messages API returns `401 x-api-key header is
+   required`), so the fix could not be verified against the literal live
+   endpoint. Instead, `mockAnthropicFetch.js` monkey-patches `window.fetch`
+   to simulate the one behavior in question — max_tokens truncation — by
+   parsing the **real** prompt text the app actually sends (same
+   `buildSummaryPrompt` output, same real 2026-08-25 thread bodies) and
+   truncating the JSON response exactly the way a real completion would
+   when the simulated output would exceed `max_tokens`. Every other line of
+   `summarizeBatchRaw`/`summarizeChunkAdaptive`/`planSummaryBatches`/
+   `callWithRetry` runs completely unmodified against it.
+
+   - `harness-summary-before.jsx` / `harness-summary-after.jsx`: copies of
+     the pre-fix and post-fix `inbox-digest.jsx`, each with only the same
+     four non-summarization network functions stubbed as in `harness.jsx`.
+   - `summary-fix-test.js` loads the real 2026-08-25 report through both,
+     under the identical mock, and counts outcomes.
+
+   **Result, last run:**
+
+   | | failed | skipped (low-text) | total |
+   |---|---|---|---|
+   | Before fix | **40 / 43** | 2 | 43 |
+   | After fix | **0 / 43** | 2 | 43 |
+
+   40/43 (not 24/43) is expected, not a discrepancy: the mock assumes a
+   uniform ~40%-of-source output for every thread in every batch (a
+   deliberate worst case), where a real model likely writes shorter
+   summaries for simple newsletters some of the time, so fewer real
+   batches tip over the edge than in this simulation. Same mechanism, same
+   order of magnitude, worse in the simulation because the simulation is
+   worse-case-biased on purpose.
+
+   `summary-retry-test.js` separately verifies the broadened retry: with
+   `mockAnthropicFetch` injecting a 429/529 on every 4th call (11 injected
+   errors across 46 total fetch attempts in the run recorded here), final
+   failures were still 0/43 — the retries absorbed them.
+
+   Rerun with:
+   ```sh
+   cd test
+   npm install
+   npx esbuild entry-summary-before.jsx --bundle --outfile=bundle-summary-before.js --loader:.jsx=jsx --jsx=automatic
+   npx esbuild entry-summary-after.jsx --bundle --outfile=bundle-summary-after.js --loader:.jsx=jsx --jsx=automatic
+   npx esbuild entry-summary-retry.jsx --bundle --outfile=bundle-summary-retry.js --loader:.jsx=jsx --jsx=automatic
+   npx http-server -p 8934 -c-1 &
+   node summary-fix-test.js
+   node summary-retry-test.js
+   ```
+   (needs the same real report fixture as above, dropped in as
+   `daily_inbox_report_2026-08-25.txt`).
+
+   **What this does not prove:** that `max_tokens` truncation is the
+   *only* thing that produced the field's 24/43, or the exact wire
+   behavior of a real truncated Anthropic response body under this
+   specific artifact runtime's `mcp_servers`/streaming setup. The
+   estimation-based batch sizing and the truncation-triggered auto-split
+   are both defensive regardless of the exact real number, and the
+   broadened retry covers the rate-limiting hypothesis too — but a live
+   re-test against 2026-08-25 in the actual Claude.ai artifact remains the
+   final confirmation this session can't perform itself.
