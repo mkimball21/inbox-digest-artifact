@@ -286,3 +286,133 @@ summarization fix, precisely because they simulate the failure mode you
 already hypothesized rather than exercising the real API's actual
 behavior — which is exactly how Round 1 missed the JSON-escaping bug.
 `live-verify.mjs` against a real report file is the authoritative check.
+
+## Round 4: fixing the adversarial review (`REVIEW.md`) findings, 2026-08-27
+
+Full findings and their severity/confidence ratings are in `../REVIEW.md`.
+This is what happened to each, in the review's own priority order.
+
+**C1 (empty/blank summary silently accepted as done) — fixed and proven.**
+`summarizeBatchRaw`'s filter now requires `summary.trim().length >=
+MIN_SUMMARY_CHARS` (10). Proven with `verify-c1-empty-summary.mjs`, which
+runs the real, unmodified `summarizeAllThreads` pipeline (no mock of the
+retry/extraction logic, only the network transport) against a synthetic
+response containing an empty-string tool call — no API key needed, since
+provoking the real model into this exact degenerate case isn't reliably
+repeatable. All 5 assertions passed: no event ever reports `done` with a
+blank summary; a thread that returns empty-then-valid ends up done with
+the real retried text; a thread that always returns empty terminates as
+`error` (not an infinite retry, not a false success); a good result in the
+same batch is unaffected. Also re-confirmed for real via the Round 3
+re-run below (0/47 real summaries needed the floor to reject anything,
+consistent with the model reliably producing real content — this is a
+safety net for the rare case, not something expected to fire every run).
+
+**C2 (Gmail success inferred from tool call, not result) — fixed in code,
+live verification blocked by a real, confirmed environmental limit.**
+`runGmailLabelAction` now pairs `mcp_tool_use` blocks with their
+`mcp_tool_result` via `tool_use_id` and only counts an ID as succeeded if
+the paired result doesn't indicate an error (`isMcpResultError`) — the
+same pattern the Drive-fetch path already used correctly. This could
+**not** be live-tested, for either the success or the failure path: a
+direct test against both `gmailmcp.googleapis.com` and
+`drivemcp.googleapis.com` with the real API key returned, verbatim,
+`"Authentication error while communicating with MCP server. Please check
+your authorization token."` — these connector URLs require the Claude.ai
+artifact runtime's own injected Google OAuth token, which a bare Anthropic
+API key from outside that runtime cannot provide. This is a general
+property of every `mcp_servers` call in this file, not specific to Gmail —
+confirmed with two independent endpoints. In other words: **no part of
+this file's Drive/Gmail MCP code path has ever been live-tested via its
+real mechanism**, only reasoned from the handoff's description and (for
+H2) verified via a *different* mechanism (this session's own directly
+attached Drive connector, not a raw Messages API call with `mcp_servers`).
+Separately confirmed the request shape itself is valid and reaches a real
+connection attempt (not a validation error) under the beta header this
+file uses (`mcp-client-2025-04-04` + inline `tool_configuration`) — a
+newer beta variant (`mcp-client-2025-11-20` + `tools: [{type:
+"mcp_toolset", ...}]`) exists and uses an incompatible request shape, but
+mixing them produces a distinct, different error from the auth failure
+above, confirming the file's current shape is a valid (if older) protocol
+choice, not malformed.
+
+**M4 (empty inbox day renders blank) — fixed and verified.** Added a
+`status === "ready" && threads.length === 0` branch with a distinct "No
+emails in the archive for {date}" message. Verified in the browser harness
+(`verify-m4-m1.js`) against a synthetic report matching
+`inbox_compilation_updated.gs`'s actual zero-email output shape
+(`Total Emails: 0`, `(no emails found)`, no `EMAIL` blocks) — confirmed
+the new message shows and is distinguishable from the not-found state.
+
+**M5 (batching is mathematically always-singleton) — decided against
+loosening, backed by computation.** Computed (not guessed) what a
+principled loosening would actually do to the real 47-thread calibration
+dataset: `BASE_OUTPUT_TOKENS_PER_THREAD` lowered to match the real p75
+(386→400) with `SUMMARY_BATCH_TARGET_OUTPUT_TOKENS` raised to 950 (still
+real headroom under 1000) produced **zero** batching improvement — still
+47/47 singleton batches, because real adjacent thread pairs are rarely
+small enough together even at that lower base. Only a materially more
+aggressive base (~250-300, *below* the real median of 209) produced
+meaningful batching (~30-40% fewer calls), trading much heavier reliance
+on the split/retry safety net for an unproven win — exactly the kind of
+speculative retuning that caused the two prior rounds of failures. Kept
+singleton-per-thread as the deliberate, real behavior (it's proven
+reliable: 0 failures across 94 real calls now, two dates, two rounds) and
+fixed the file's own comment, which previously (falsely) claimed the
+constants "let more than one small thread share a batch."
+
+**M1 (cache crash risk) — fixed and verified.** Added
+`CACHE_SCHEMA_VERSION` + `isValidCachedThreads` (rejects a version
+mismatch or malformed shape as a clean cache miss instead of loading it)
+and a `DigestErrorBoundary` wrapping the ready-state render tree (contains
+a render crash to that date's content area with a "clear this date's cache
+and retry" action, instead of a blank white app). Verified in
+`verify-m4-m1.js`: a cache entry persisted by the current code carries
+`schemaVersion: 1`; an injected old-shape entry (no `schemaVersion`, wrong
+object shape) for a fresh date is correctly treated as a cache miss (a
+real fetch fires) with no crash. The error boundary itself wasn't
+triggered by an actual render throw in testing — the schema-version check
+already prevents the specific scenario M1 described from reaching render
+at all, so the boundary is a second layer of defense for other failure
+modes, verified by code inspection rather than a forced crash.
+
+**M2 (no in-flight guard on toggles/Mark All Read) — deferred.** Real,
+code-verified race, but the fix (an in-flight-tracking Set threaded
+through every toggle handler and Mark All Read) is a larger, more
+invasive change than the time budget for this pass allowed once items
+1-3 and their real verification were prioritized, per the task's own
+instructions. Left for a follow-up pass.
+
+**M3 (unserialized cache writes) — fixed.** `storageSet` now keeps one
+pending-write promise chain per key, so writes to the same key always
+apply in the order they were issued regardless of network/timing.
+Implemented and correct by construction (a straightforward promise
+chain); not stress-tested under real heavy concurrent write load (would
+need a very large report and instrumented `window.storage` timing to
+observe directly) — the regression suite confirms no behavioral change
+for the normal case.
+
+**Minors — N1 (fragile low-text string match), N3 (retry budget not
+threaded through splits), N6 (no CSS truncation on long sender names), N7
+(dead `rawContent` field) fixed** — all cheap, low-risk, confirmed via the
+full regression re-run (`nav-test.js`, `fullbody-test.js`) passing
+unchanged afterward. **N2, N4, N5, N8, N9 deferred** — none are
+correctness bugs (N2: unused-but-harmless header counts; N4: retry-stacking
+without outer backoff, bounded and low-frequency; N5: concurrency doesn't
+recover mid-run, scoped to one date-load; N8/N9: UX judgment calls the
+review itself flagged as low-confidence) and fixing them would have traded
+time against verifying items 1-3, which the task explicitly prioritized.
+
+**Final mandatory re-verification** (`live-verify.mjs`, real API, real
+unmodified pipeline, run *after* all the above changes):
+
+```
+2026-08-25 (43 threads): 41/41 summarized, 0 failed, 185.3s
+2026-08-01 (7 threads):   6/6 summarized, 0 failed, 28.4s
+```
+
+47 real calls, all `stop_reason: tool_use`. Combined with the C1 proof
+test and the M4/M1 browser verification, this is the evidence behind
+every "fixed and verified" claim above; C2 is the one item still
+genuinely unverified end-to-end, for the environmental reason explained
+above, not because it wasn't attempted.

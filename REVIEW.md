@@ -18,6 +18,20 @@ nothing here should be read as "verified" unless it says so.
 
 ---
 
+## Status update, 2026-08-27 (follow-up pass)
+
+C1, C2, and M4 fixed. M5 decided (kept singleton, fixed the false comment
+— see the reasoning below, backed by real computation, not just written
+in). M1 and M3 fixed. Several Minors fixed; several explicitly deferred.
+Full detail, what's verified vs. still genuinely unverified (notably C2's
+live Gmail test — blocked by a real, confirmed environmental limit, not
+skipped), and exact commit are in the PR description and `test/README.md`.
+This file is left as originally written below — the findings themselves
+were accurate at the time and are the record of what was found; do not
+edit the sections below to retroactively describe them as fixed.
+
+---
+
 ## Critical
 
 ### C1. An empty or whitespace-only model-provided summary is silently accepted as success
