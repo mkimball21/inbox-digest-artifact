@@ -32,38 +32,16 @@ const DRIVE_FOLDER_ID = "1bZFXxjhcpSSYShN03YSiZbuhBIoqno5C";
 // H4: batches are sized to an ESTIMATED OUTPUT-TOKEN BUDGET (see
 // planSummaryBatches / estimateThreadOutputTokens), not a flat thread count.
 // A flat 5-threads-per-batch looked safe on paper but doesn't hold on real
-// data. The estimator itself and this target were both calibrated
-// 2026-08-27 against 47 real single-thread Messages API calls (see the
-// comment above estimateThreadOutputTokens) — real per-thread output
-// topped out at 828 tokens with p95=523, so 900 leaves real headroom under
-// the fixed max_tokens: 1000 cap.
-//
-// IMPORTANT, decided 2026-08-27 (adversarial review finding M5): under
-// these constants, planSummaryBatches produces a batch of exactly 1 thread
-// on effectively every real call — verified both empirically (all 47
-// batches on the two live-tested dates were singleton) AND by direct
-// arithmetic (the minimum possible single-thread estimate, 640, already
-// exceeds half of 900, so no two threads can ever combine). A materially
-// looser, still-principled calibration was computed and tested against the
-// same real 47-thread dataset before deciding this: even BASE lowered to
-// match the real p75 (386) with TARGET raised to 950 (still real headroom
-// under 1000) produced ZERO batching improvement (0% fewer calls) on the
-// actual data — real adjacent thread pairs are rarely small enough
-// together. Only a much more aggressive base (~250-300, below the real
-// *median* of 209) produced meaningful batching (~30-40% fewer calls),
-// which trades materially more reliance on the split/retry safety net for
-// an uncertain, non-guaranteed win — exactly the kind of speculative
-// retuning that caused the two prior rounds of failures. Given
-// singleton-per-thread calling is proven reliable (0 failures across 47
-// real calls on two real dates), this file keeps it as the real, deliberate
-// behavior rather than gambling on a bigger loosening for unproven benefit.
-// SUMMARY_BATCH_MAX_THREADS and the batching-by-token-budget structure are
-// kept as-is (harmless, and correctly handle a future recalibration if
-// real data ever justifies revisiting this). Concurrency starts at 3 (not
-// 4) and steps down toward 1 if 429/529 responses are observed (H4's
-// "untested" concurrency risk).
+// data: at the spec'd 25-50% summary length, a batch of 5 real threads from
+// the 2026-08-25 report needs ~1,400-4,400 estimated output tokens against
+// the fixed max_tokens: 1000 cap, which truncates the model's JSON mid-array
+// and fails every thread in that batch. SUMMARY_BATCH_MAX_THREADS is now
+// only a secondary cap; SUMMARY_BATCH_TARGET_OUTPUT_TOKENS is the real one.
+// Concurrency starts at 3 (not 4) and steps down toward 1 if 429/529
+// responses are observed (H4's "untested" concurrency risk — real, but
+// secondary to the batch-sizing bug above).
 const SUMMARY_BATCH_MAX_THREADS = 5;
-const SUMMARY_BATCH_TARGET_OUTPUT_TOKENS = 900; // headroom under the 1000 cap
+const SUMMARY_BATCH_TARGET_OUTPUT_TOKENS = 700; // headroom under the 1000 cap
 const JSON_OVERHEAD_TOKENS_PER_THREAD = 40;
 const SUMMARY_CONCURRENCY_DEFAULT = 3;
 const SUMMARY_CONCURRENCY_MIN = 1;
@@ -94,10 +72,6 @@ const GMAIL_ACTION_CONFIG = {
 };
 
 const LOW_TEXT_PLACEHOLDER = "Low text content / possibly image-heavy email";
-// Mirrors inbox_compilation_updated.gs's CONFIG.LOW_TEXT_THRESHOLD — see N1
-// in the adversarial review for why this is used as a fallback alongside
-// the exact placeholder-string match above.
-const LOW_TEXT_THRESHOLD = 120;
 
 // ---------------------------------------------------------------------------
 // window.storage helpers (H7, H8)
@@ -119,55 +93,16 @@ async function storageGet(key) {
   }
 }
 
-// M3 (adversarial review, 2026-08-27): callers fire storageSet for the same
-// key repeatedly in quick succession (once per thread completing during a
-// summarization sweep) without awaiting each other. Left unserialized, an
-// earlier write that happens to resolve later than a subsequent one could
-// overwrite it, silently dropping already-shown data from the persisted
-// cache. This keeps one pending-write chain per key so writes to the same
-// key always apply in the order they were issued; different keys are
-// unaffected and still run independently.
-const pendingWritesByKey = new Map();
-
 async function storageSet(key, value) {
-  const previous = pendingWritesByKey.get(key) || Promise.resolve();
-  const next = previous
-    .catch(() => {}) // a prior failure shouldn't block this write from attempting
-    .then(async () => {
-      try {
-        await window.storage.set(key, value);
-      } catch (err) {
-        console.error("digest: storage write failed for", key, err);
-      }
-    });
-  pendingWritesByKey.set(key, next);
-  return next;
+  try {
+    await window.storage.set(key, value);
+  } catch (err) {
+    console.error("digest: storage write failed for", key, err);
+  }
 }
 
 function cacheKeyForDate(date) {
   return `digest:${date}`;
-}
-
-// M1 (adversarial review, 2026-08-27): a bare `Array.isArray(cached.threads)`
-// check says nothing about whether the objects INSIDE that array match the
-// shape this version of the code expects. If a future edit changes the
-// thread/message shape, an old cache entry could otherwise be loaded
-// directly into state and crash the render for that date (no error
-// boundary previously existed either — see ErrorBoundary below). Bumping
-// this on any future breaking change to the persisted shape makes a
-// mismatched old entry a clean cache miss instead.
-const CACHE_SCHEMA_VERSION = 1;
-
-function isValidCachedThreads(cached) {
-  if (!cached || cached.schemaVersion !== CACHE_SCHEMA_VERSION || !Array.isArray(cached.threads)) return false;
-  return cached.threads.every(
-    (t) =>
-      t &&
-      typeof t.threadId === "string" &&
-      Array.isArray(t.messages) &&
-      t.messages.length > 0 &&
-      typeof t.summaryStatus === "string"
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +183,6 @@ function parseEmailBlock(blockText) {
   const fromDisplay = (fields["From"] || "").trim();
   const { name: fromName, email: fromEmail } = parseFromDisplay(fromDisplay);
 
-  const bodyLength = parseInt(fields["Body Length"] || "0", 10) || 0;
-
   return {
     messageId,
     threadId,
@@ -258,17 +191,9 @@ function parseEmailBlock(blockText) {
     fromDisplay: fromDisplay || "(unknown sender)",
     fromName,
     fromEmail,
-    bodyLength,
+    bodyLength: parseInt(fields["Body Length"] || "0", 10) || 0,
     truncated: (fields["Truncated"] || "").trim().toLowerCase() === "yes",
-    // N1 (adversarial review, 2026-08-27): the exact-string match against
-    // LOW_TEXT_PLACEHOLDER is coupled to a literal defined separately in
-    // inbox_compilation_updated.gs — if the two ever drift, this silently
-    // stops detecting low-text bodies and a placeholder sentence could get
-    // sent to summarization as if it were real content. bodyLength (the
-    // report's own field, independent of the placeholder string) mirrors
-    // the upstream script's own LOW_TEXT_THRESHOLD (120) as a fallback
-    // signal that doesn't depend on the two literals staying in sync.
-    lowText: body === LOW_TEXT_PLACEHOLDER || bodyLength < LOW_TEXT_THRESHOLD,
+    lowText: body === LOW_TEXT_PLACEHOLDER,
     body,
   };
 }
@@ -369,7 +294,7 @@ function dayScopingLabel(thread) {
 // every extraction here filters explicitly by `type`, never by array index.
 // ---------------------------------------------------------------------------
 
-async function callMessagesAPI({ userText, mcpServers, tools, toolChoice }) {
+async function callMessagesAPI({ userText, mcpServers }) {
   const body = {
     model: MODEL,
     max_tokens: MAX_TOKENS,
@@ -382,16 +307,6 @@ async function callMessagesAPI({ userText, mcpServers, tools, toolChoice }) {
   // any MCP server, Gmail included.
   if (mcpServers && mcpServers.length > 0) {
     body.mcp_servers = mcpServers;
-  }
-  // `tools` here is the ordinary Messages API structured-output mechanism
-  // (a local JSON schema the model fills in) — unrelated to `mcp_servers`
-  // and the H3 hazard. It grants the model no external capability at all,
-  // only a formatting contract for its own reply. Summarization uses it to
-  // get guaranteed-valid JSON back (see summarizeBatchRaw); it is never
-  // combined with mcp_servers in the same request.
-  if (tools) {
-    body.tools = tools;
-    if (toolChoice) body.tool_choice = toolChoice;
   }
 
   const res = await fetch(MESSAGES_API_URL, {
@@ -449,27 +364,6 @@ function textFromMcpResultBlock(block) {
   return "";
 }
 
-/**
- * C2 (adversarial review, 2026-08-27): whether a paired mcp_tool_result
- * block indicates the underlying tool call actually failed. Calling a
- * tool (an mcp_tool_use block existing) is not the same as it succeeding
- * — the result block is the one that carries the real outcome. Checked
- * defensively against a few plausible field shapes (is_error being the
- * most standard, matching the ordinary tool_result content-block schema)
- * since this file's own live testing never exercised a real Gmail-side
- * failure to confirm the exact shape; see the note on runGmailLabelAction.
- */
-function isMcpResultError(block) {
-  if (!block) return true; // no paired result at all — can't confirm success, don't assume it
-  if (block.is_error === true || block.isError === true) return true;
-  const text = textFromMcpResultBlock(block);
-  const parsed = tryParseJsonLoose(text);
-  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-    if (parsed.error || parsed.isError === true || parsed.is_error === true) return true;
-  }
-  return false;
-}
-
 function tryParseJsonLoose(text) {
   const cleaned = String(text || "")
     .trim()
@@ -497,21 +391,16 @@ function extractMcpToolResultJson(content, toolName) {
 // Drive fetch (section 2)
 // ---------------------------------------------------------------------------
 
-window.__test = window.__test || { fetchReportCalls: 0, gmailActionCalls: [], summarizeCalls: 0, nextReport: null };
+window.__test = window.__test || { fetchReportCalls: 0, gmailActionCalls: [] };
 
 async function fetchAvailableDates() {
-  return ["2026-08-25", "2026-08-24"];
+  return ["2026-08-25"];
 }
 
 async function fetchReportForDate(date) {
   window.__test.fetchReportCalls++;
-  if (window.__test.nextReport !== null) {
-    const r = window.__test.nextReport;
-    window.__test.nextReport = null;
-    return r;
-  }
   if (date !== "2026-08-25") return null;
-  const res = await fetch("/daily_inbox_report_2026-08-25.txt");
+  const res = await window.__realFetch("/daily_inbox_report_2026-08-25.txt");
   return res.text();
 }
 
@@ -519,14 +408,183 @@ async function fetchReportForDate(date) {
 // Summarization (section 4; H3, H4)
 // ---------------------------------------------------------------------------
 
-async function summarizeAllThreads(threads, onThreadDone) {
-  window.__test.summarizeCalls++;
+function buildSummaryPrompt(threadsBatch, { forceShort = false } = {}) {
+  const parts = threadsBatch.map((t) => {
+    const bodyText = t.messages
+      .map(
+        (m, mi) =>
+          `Message ${mi + 1} of ${t.messages.length}${m.truncated ? " (TRUNCATED at 5000 characters)" : ""} — from ${m.fromDisplay} at ${m.timestampFull}:\n${m.body}`
+      )
+      .join("\n---\n");
+    return `Thread (threadId: ${t.threadId}, subject: "${t.subject}"):\n${bodyText}`;
+  });
+
+  // forceShort is only used for a single-thread retry after that thread's
+  // own summary alone overflowed the output budget (see
+  // summarizeChunkAdaptive) — there's nothing left to split at that point,
+  // so the ask changes from "25-50%" to "as much as fits."
+  const lengthInstruction = forceShort
+    ? '- This thread\'s full source is too long to summarize at 25-50% length within the available space — instead write the most complete, useful summary that fits, and end it with the exact text "[summary shortened due to length]".'
+    : "- Is roughly 25-50% of that thread's combined source length by word count — a short source gets a short summary, a long/dense source gets a longer one. Do not pad short emails or force long ones down to a uniform length.";
+
+  return (
+    "You are writing digest summaries of email threads for someone who will read ONLY your summary, never the original. " +
+    "For EACH thread below, write a summary that:\n" +
+    "- Replaces the need to read the original: include concrete details, figures, actions, and deadlines explicitly.\n" +
+    "- Covers every message in the thread, not just the first.\n" +
+    "- Explicitly notes if any message in the thread was truncated at 5,000 characters.\n" +
+    lengthInstruction +
+    "\n" +
+    "- Never invents content that is not in the source.\n\n" +
+    "Threads:\n\n" +
+    parts.join("\n\n=====\n\n") +
+    "\n\n" +
+    'Return ONLY a JSON array, no markdown code fences, no commentary before or after it: [{"threadId": "...", "summary": "..."}, ...]'
+  );
+}
+
+/**
+ * Estimates the output tokens one thread's summary will need, so batches can
+ * be sized to the fixed max_tokens: 1000 budget (H4) instead of a flat
+ * thread count. Verified against the real 2026-08-25 report: several
+ * threads (multi-message chains, 5,000-char truncated bodies) need
+ * 300-900+ output tokens on their own once the spec'd 25-50% length is
+ * applied, so 5 of them together routinely overflow 1000 tokens.
+ *
+ * Estimates off the upper end (50%) of the length range on purpose — sizing
+ * to the average case still overflows whenever a batch happens to skew
+ * long, which is exactly what real data does.
+ */
+function estimateThreadOutputTokens(thread) {
+  const combinedChars = thread.messages.reduce((sum, m) => sum + (m.lowText ? 0 : m.body.length), 0);
+  const summaryChars = combinedChars * 0.5;
+  return Math.ceil(summaryChars / 4) + JSON_OVERHEAD_TOKENS_PER_THREAD;
+}
+
+/**
+ * Builds variable-size batches bounded by SUMMARY_BATCH_TARGET_OUTPUT_TOKENS
+ * (primary bound) and SUMMARY_BATCH_MAX_THREADS (secondary bound), instead
+ * of a flat SUMMARY_BATCH_SIZE. This is the actual fix for the max_tokens
+ * truncation bug — see the comment above estimateThreadOutputTokens.
+ */
+function planSummaryBatches(threads) {
+  const batches = [];
+  let current = [];
+  let currentEstTokens = 0;
+
   for (const t of threads) {
-    await new Promise((r) => setTimeout(r, 5));
-    onThreadDone(t.threadId, {
-      status: "done",
-      summary: `[test summary] ${t.messages.length} message(s), subject "${t.subject}".`,
+    const est = estimateThreadOutputTokens(t);
+    const wouldOverflow = currentEstTokens + est > SUMMARY_BATCH_TARGET_OUTPUT_TOKENS;
+    const atCountLimit = current.length >= SUMMARY_BATCH_MAX_THREADS;
+    if (current.length > 0 && (wouldOverflow || atCountLimit)) {
+      batches.push(current);
+      current = [];
+      currentEstTokens = 0;
+    }
+    current.push(t);
+    currentEstTokens += est;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+/** One batched call per chunk of threads. Never one call per email/thread. */
+async function summarizeBatchRaw(threadsBatch, { forceShort = false } = {}) {
+  const data = await callWithRetry(() =>
+    callMessagesAPI({
+      userText: buildSummaryPrompt(threadsBatch, { forceShort }),
+      // H3, hard architectural rule: summarization calls attach NO MCP
+      // server — not Gmail, not Drive, nothing. `mcpServers: []` above means
+      // `callMessagesAPI` never sets `mcp_servers` on this request at all.
+      mcpServers: [],
+    })
+  );
+  const raw = blocksByType(data.content, "text")
+    .map((b) => b.text)
+    .join("\n");
+  const parsed = tryParseJsonLoose(raw);
+  if (!Array.isArray(parsed)) {
+    // Surface the actual cause instead of a generic message: whether the
+    // model's own response was cut off at the token cap (stop_reason
+    // "max_tokens" — the real, confirmed cause on real data) or something
+    // else, plus a look at exactly where the text ends so a genuinely new
+    // failure mode is diagnosable from the UI without re-instrumenting.
+    const err = new Error(
+      `Summary response was not valid JSON (stop_reason: ${data.stop_reason || "unknown"}, ` +
+        `response ends: ${JSON.stringify(raw.slice(-200))})`
+    );
+    err.truncated = data.stop_reason === "max_tokens";
+    err.stopReason = data.stop_reason;
+    throw err;
+  }
+  return parsed;
+}
+
+/**
+ * Summarizes one batch, recovering from max_tokens truncation by splitting
+ * the batch and retrying the halves — a batch that overflowed max_tokens
+ * once will overflow again unchanged, so a plain retry can't fix it, only a
+ * smaller batch can. Bottoms out at a single thread; if even one thread's
+ * own summary overflows, retries once more asking for a best-effort
+ * shortened summary instead of splitting further (there's nothing smaller
+ * to split into). Returns { sawRateLimit } so the caller can step down
+ * concurrency across rounds (H4).
+ */
+async function summarizeChunkAdaptive(threadsBatch, onThreadDone, forceShort = false) {
+  try {
+    const parsed = await summarizeBatchRaw(threadsBatch, { forceShort });
+    const byId = new Map(parsed.map((p) => [p.threadId, p.summary]));
+    threadsBatch.forEach((t) => {
+      const summary = byId.get(t.threadId);
+      onThreadDone(
+        t.threadId,
+        summary
+          ? { status: "done", summary }
+          : { status: "error", error: `Thread ${t.threadId} was not present in the summary response.` }
+      );
     });
+    return { sawRateLimit: false };
+  } catch (err) {
+    if (err.truncated && threadsBatch.length > 1) {
+      const mid = Math.ceil(threadsBatch.length / 2);
+      const [a, b] = await Promise.all([
+        summarizeChunkAdaptive(threadsBatch.slice(0, mid), onThreadDone),
+        summarizeChunkAdaptive(threadsBatch.slice(mid), onThreadDone),
+      ]);
+      return { sawRateLimit: a.sawRateLimit || b.sawRateLimit };
+    }
+    if (err.truncated && threadsBatch.length === 1 && !forceShort) {
+      return summarizeChunkAdaptive(threadsBatch, onThreadDone, true);
+    }
+    const sawRateLimit = err.status === 429 || err.status === 529;
+    threadsBatch.forEach((t) => onThreadDone(t.threadId, { status: "error", error: String(err.message || err) }));
+    return { sawRateLimit };
+  }
+}
+
+/**
+ * Summarizes `threads` (already filtered to those needing it) in batches
+ * planned by planSummaryBatches, running batches concurrently (H4) and
+ * streaming each thread's result in via onThreadDone as soon as its batch
+ * resolves — never blocking the whole view on the full set. Steps
+ * concurrency down toward SUMMARY_CONCURRENCY_MIN, one step per round, if
+ * 429/529 responses are observed.
+ */
+async function summarizeAllThreads(threads, onThreadDone) {
+  const chunks = planSummaryBatches(threads);
+
+  let concurrency = SUMMARY_CONCURRENCY_DEFAULT;
+  let cursor = 0;
+
+  while (cursor < chunks.length) {
+    const round = chunks.slice(cursor, cursor + concurrency);
+    const results = await Promise.all(round.map((chunk) => summarizeChunkAdaptive(chunk, onThreadDone)));
+    const sawRateLimit = results.some((r) => r.sawRateLimit);
+
+    if (sawRateLimit && concurrency > SUMMARY_CONCURRENCY_MIN) {
+      concurrency -= 1;
+    }
+    cursor += round.length;
   }
 }
 
@@ -548,27 +606,16 @@ function buildGmailActionPrompt(tool, labelIds, messageIds) {
 /**
  * Fires a Gmail label/unlabel action for a flat list of message IDs, chunked
  * (H6) and run with bounded concurrency. Returns which IDs the response
- * actually confirms succeeded vs which are unconfirmed/failed.
- *
- * C2 (adversarial review, 2026-08-27): "confirms succeeded" now means the
- * matching mcp_tool_use block has a paired mcp_tool_result (via
- * tool_use_id) that doesn't indicate an error — not just that a
- * mcp_tool_use block naming that ID exists. The model calling the tool is
- * not the same as the tool succeeding; this file's own Drive-fetch path
- * already reads mcp_tool_result as the authoritative outcome
- * (extractMcpToolResultJson) — this brings the Gmail write path in line
- * with that same pattern instead of only checking tool_use presence. A
- * network/parse failure still marks the whole chunk failed rather than
- * assumed-successful.
+ * actually confirms were acted on (via mcp_tool_use blocks naming that exact
+ * tool + messageId) vs which are unconfirmed/failed — a network or parse
+ * failure marks its whole chunk as failed rather than assumed-successful.
  */
 async function runGmailLabelAction(actionKey, messageIds) {
   window.__test.gmailActionCalls.push({ actionKey, messageIds: [...messageIds] });
-  await new Promise((r) => setTimeout(r, 5));
   return { succeeded: new Set(messageIds), failed: new Set() };
 }
 
 async function fetchFullBody(messageId) {
-  await new Promise((r) => setTimeout(r, 5));
   return `[test full body for ${messageId}] `.repeat(50);
 }
 
@@ -607,56 +654,6 @@ function StarIcon({ filled }) {
 
 function scrollToRef(ref) {
   if (ref && ref.current) ref.current.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-// M1 (adversarial review, 2026-08-27): with no error boundary anywhere,
-// any render-time throw (a malformed cache entry that slipped past
-// isValidCachedThreads, an unexpected data shape) previously unmounted the
-// entire artifact to a blank/broken page. This contains a crash to just
-// the date's content area and offers a way back out — clearing that one
-// cached entry — rather than losing the whole app.
-class DigestErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { error: null };
-  }
-  static getDerivedStateFromError(error) {
-    return { error };
-  }
-  componentDidCatch(error) {
-    console.error("digest: render error", error);
-  }
-  handleClearAndReload = () => {
-    const key = this.props.cacheKey;
-    (async () => {
-      try {
-        if (key) await window.storage.set(key, null);
-      } catch (err) {
-        // best-effort — window.storage may not support deleting a key at
-        // all; a null value is still a safe, valid-looking "no cache" for
-        // isValidCachedThreads to reject on the next load either way.
-      }
-      this.setState({ error: null });
-      if (this.props.onClear) this.props.onClear();
-    })();
-  };
-  render() {
-    if (this.state.error) {
-      return (
-        <div style={{ color: "#8B3A3A", padding: "3rem 1.5rem", textAlign: "center" }}>
-          <p>Something went wrong rendering this date's digest.</p>
-          <p
-            className="digest-link"
-            style={{ display: "inline-block", marginTop: "0.5rem" }}
-            onClick={this.handleClearAndReload}
-          >
-            Clear this date's cache and try again
-          </p>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -724,7 +721,7 @@ export default function InboxDigest() {
 
   const persistThreads = useCallback(
     (date, nextThreads) => {
-      storageSet(cacheKeyForDate(date), { schemaVersion: CACHE_SCHEMA_VERSION, threads: nextThreads, savedAt: Date.now() });
+      storageSet(cacheKeyForDate(date), { threads: nextThreads, savedAt: Date.now() });
     },
     []
   );
@@ -771,12 +768,9 @@ export default function InboxDigest() {
       const key = cacheKeyForDate(date);
       const cached = await storageGet(key);
 
-      if (isValidCachedThreads(cached)) {
+      if (cached && Array.isArray(cached.threads)) {
         // Requirement 6: a second load of an already-generated date renders
-        // instantly with no re-fetch and no re-summarization. M1: a
-        // schema-version mismatch or malformed entry is treated as a clean
-        // cache miss here (falls through to a normal fetch below) rather
-        // than being loaded and risking a render crash.
+        // instantly with no re-fetch and no re-summarization.
         setThreads(cached.threads);
         setStatus("ready");
         const stillPending = cached.threads.filter((t) => t.summaryStatus === "pending");
@@ -1056,29 +1050,8 @@ export default function InboxDigest() {
           </div>
         )}
 
-        {/* M4 (adversarial review, 2026-08-27): a real, working upstream
-            code path (inbox_compilation_updated.gs writes "(no emails
-            found)" / zero EMAIL blocks for a genuinely quiet day) produced
-            a blank page here with no message — distinct from, and easily
-            confused with, a broken load. This is a real report that
-            parsed successfully to zero threads, not a missing report
-            (that's the separate not-found state above). */}
-        {status === "ready" && threads.length === 0 && (
-          <div style={{ color: COLORS.textSecondary, padding: "3rem 0", textAlign: "center" }}>
-            No emails in the archive for {selectedDate}.
-          </div>
-        )}
-
         {status === "ready" && threads.length > 0 && (
-          <DigestErrorBoundary
-            key={selectedDate}
-            cacheKey={cacheKeyForDate(selectedDate)}
-            onClear={() => {
-              setSelectedDate("");
-              setStatus("blank");
-              setThreads([]);
-            }}
-          >
+          <>
             {/* Sticky jump bar */}
             <div className="digest-jumpbar flex gap-4 py-3 mb-6">
               <span className="digest-link" onClick={() => scrollToRef(contentsRef)}>
@@ -1150,18 +1123,7 @@ export default function InboxDigest() {
                               {idx + 1}. {t.subject}
                             </span>
                           </div>
-                          <div
-                            className="digest-mono"
-                            style={{
-                              color: COLORS.textSecondary,
-                              fontSize: "0.85rem",
-                              marginTop: "0.15rem",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                            }}
-                            title={`${t.messages[0].fromDisplay} · ${t.earliestTimestamp}`}
-                          >
+                          <div className="digest-mono" style={{ color: COLORS.textSecondary, fontSize: "0.85rem", marginTop: "0.15rem" }}>
                             {t.messages[0].fromDisplay} · {t.earliestTimestamp}
                           </div>
                           {participantsLine && (
@@ -1279,7 +1241,7 @@ export default function InboxDigest() {
                 ))}
               </div>
             </section>
-          </DigestErrorBoundary>
+          </>
         )}
       </main>
 
