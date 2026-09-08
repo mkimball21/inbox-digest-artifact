@@ -1,0 +1,540 @@
+<!--
+  Served by doGet() in WebApp.gs. VERIFICATION STATUS: code-complete, NOT
+  live-verified — HtmlService's sandboxed iframe and google.script.run's
+  callback model only exist in a real deployed Apps Script web app, which
+  this coding session cannot reach. See /apps-script/VERIFICATION.md for
+  exactly what that means and what to check first, in order, once deployed
+  (payload size on a busy day, jump-bar/back-to-top on a real phone, actual
+  google.script.run round-trip latency, mark-all-read against a starred
+  thread).
+
+  Layout requirements (from apps_script_digest_handoff.md, carried over
+  unchanged from the original artifact's explicit, deliberate design
+  decision): ONE continuous scroll, three sections — Contents / Summaries /
+  Full Emails — never a two-pane click-through interface.
+-->
+<style>
+  :root {
+    --bg: #EDEEEA;
+    --ink: #23241F;
+    --navy: #1D3557;
+    --mustard: #C98A2D;
+    --card-bg: #FFFFFF;
+    --border: #D8D6CC;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: Georgia, 'Times New Roman', serif;
+    line-height: 1.5;
+  }
+
+  .mono {
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.82rem;
+    color: #55564d;
+  }
+
+  header.page-header {
+    padding: 1.5rem 1.25rem 1rem;
+    border-bottom: 2px solid var(--navy);
+    position: relative;
+  }
+
+  h1 {
+    margin: 0 0 0.75rem;
+    font-size: 1.6rem;
+    letter-spacing: 0.02em;
+    color: var(--navy);
+  }
+
+  .controls-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+  }
+
+  select, button {
+    font-family: inherit;
+    font-size: 0.95rem;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid var(--navy);
+    border-radius: 3px;
+    background: var(--card-bg);
+    color: var(--ink);
+    cursor: pointer;
+  }
+
+  button.primary {
+    background: var(--navy);
+    color: #fff;
+  }
+
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .date-badge {
+    position: absolute;
+    top: 1.25rem;
+    right: 1.25rem;
+    transform: rotate(-6deg);
+    border: 2px solid var(--mustard);
+    color: var(--mustard);
+    font-family: 'Courier New', monospace;
+    font-weight: bold;
+    padding: 0.3rem 0.6rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    letter-spacing: 0.05em;
+    background: rgba(201, 138, 45, 0.08);
+  }
+
+  .jump-bar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--navy);
+    color: #fff;
+    display: flex;
+    gap: 1.25rem;
+    padding: 0.55rem 1.25rem;
+    font-size: 0.9rem;
+  }
+
+  .jump-bar a {
+    color: #fff;
+    text-decoration: none;
+    opacity: 0.85;
+    cursor: pointer;
+  }
+  .jump-bar a:hover { opacity: 1; text-decoration: underline; }
+
+  main { max-width: 760px; margin: 0 auto; padding: 1.25rem; }
+
+  section.digest-section { margin-bottom: 2.5rem; }
+
+  section.digest-section > h2 {
+    font-size: 1.15rem;
+    color: var(--navy);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.4rem;
+  }
+
+  #contents-list { padding-left: 1.2rem; }
+  #contents-list li { margin-bottom: 0.35rem; cursor: pointer; }
+  #contents-list li:hover { text-decoration: underline; }
+  #contents-list .day-scope-note { color: var(--mustard); font-style: italic; font-size: 0.85rem; margin-left: 0.4rem; }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1rem 1.1rem;
+    margin-bottom: 1rem;
+  }
+
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .card-subject { font-size: 1.05rem; font-weight: bold; }
+  .card-participants { font-size: 0.85rem; color: #55564d; margin-top: 0.15rem; }
+
+  .status-icons { display: flex; gap: 0.5rem; align-items: center; white-space: nowrap; }
+  .icon-btn {
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    border-radius: 3px;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .icon-btn.active { background: var(--mustard); color: #fff; border-color: var(--mustard); }
+
+  .summary-text { margin-top: 0.6rem; white-space: pre-wrap; }
+  .summary-status-note { margin-top: 0.6rem; font-style: italic; color: #8a6d1f; }
+  .summary-status-note.failed { color: #a63d3d; }
+
+  .jump-link { font-size: 0.85rem; color: var(--navy); cursor: pointer; text-decoration: underline; }
+
+  .day-scoping-label {
+    display: inline-block;
+    margin-top: 0.3rem;
+    font-size: 0.8rem;
+    color: var(--mustard);
+  }
+
+  .message-block { border-top: 1px dashed var(--border); padding-top: 0.6rem; margin-top: 0.6rem; }
+  .message-block:first-child { border-top: none; margin-top: 0; padding-top: 0; }
+  .message-body { white-space: pre-wrap; margin-top: 0.4rem; }
+
+  #back-to-top {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    border-radius: 50%;
+    width: 3rem;
+    height: 3rem;
+    background: var(--navy);
+    color: #fff;
+    border: none;
+    font-size: 1.2rem;
+    cursor: pointer;
+    display: none;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+
+  .empty-state, .error-state {
+    padding: 3rem 1rem;
+    text-align: center;
+    color: #55564d;
+    font-size: 1.05rem;
+  }
+
+  .loading-note { padding: 1.5rem; text-align: center; color: #55564d; }
+
+  @media (max-width: 480px) {
+    .date-badge { position: static; display: inline-block; transform: rotate(-3deg); margin-top: 0.5rem; }
+    header.page-header { padding-bottom: 0.5rem; }
+  }
+</style>
+
+<header class="page-header">
+  <h1>Inbox Digest</h1>
+  <div class="controls-row">
+    <select id="date-select"></select>
+    <button id="regenerate-btn" title="Re-run parsing + summarization for this date">Regenerate</button>
+    <button id="mark-all-read-btn" class="primary">Mark all read</button>
+  </div>
+  <div class="date-badge" id="date-badge"></div>
+</header>
+
+<div class="jump-bar" id="jump-bar" style="display:none;">
+  <a data-jump="contents">Contents</a>
+  <a data-jump="summaries">Summaries</a>
+  <a data-jump="full-emails">Full emails</a>
+</div>
+
+<main id="main-content">
+  <div class="loading-note" id="loading-note">Loading available dates…</div>
+</main>
+
+<button id="back-to-top" title="Back to top">↑</button>
+
+<script>
+  var currentDigest = null;
+  var currentReadStarState = null;
+  var currentDate = null;
+
+  function byId(id) { return document.getElementById(id); }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  // ---- Boot: list dates, load the newest one ----
+  google.script.run
+    .withSuccessHandler(function (dates) {
+      var select = byId('date-select');
+      if (!dates || dates.length === 0) {
+        byId('main-content').innerHTML = '<div class="empty-state">No digests have been generated yet.</div>';
+        return;
+      }
+      dates.forEach(function (d) {
+        var opt = document.createElement('option');
+        opt.value = d;
+        opt.textContent = d;
+        select.appendChild(opt);
+      });
+      select.addEventListener('change', function () { loadDate(select.value); });
+      loadDate(dates[0]);
+    })
+    .withFailureHandler(function (err) {
+      byId('main-content').innerHTML = '<div class="error-state">Failed to list available dates: ' + escapeHtml(err.message || err) + '</div>';
+    })
+    .listAvailableDates();
+
+  function loadDate(dateStr) {
+    currentDate = dateStr;
+    byId('date-select').value = dateStr;
+    byId('date-badge').textContent = dateStr;
+    byId('jump-bar').style.display = 'none';
+    byId('main-content').innerHTML = '<div class="loading-note">Loading digest for ' + escapeHtml(dateStr) + '…</div>';
+
+    google.script.run
+      .withSuccessHandler(handleDigestResponse)
+      .withFailureHandler(function (err) {
+        byId('main-content').innerHTML = '<div class="error-state">Failed to load digest: ' + escapeHtml(err.message || err) + '</div>';
+      })
+      .getDigestForDate(dateStr);
+  }
+
+  function handleDigestResponse(response) {
+    if (response.status === 'not-found') {
+      byId('main-content').innerHTML = '<div class="empty-state">No report found for ' + escapeHtml(response.date) + '.</div>';
+      return;
+    }
+    if (response.status === 'empty') {
+      byId('main-content').innerHTML = '<div class="empty-state">No emails in the archive for ' + escapeHtml(response.date) + '.</div>';
+      return;
+    }
+    currentDigest = response.digest;
+    currentReadStarState = response.readStarState;
+    renderDigest();
+  }
+
+  function renderDigest() {
+    var digest = currentDigest;
+    byId('jump-bar').style.display = 'flex';
+
+    var contentsHtml = digest.threads.map(function (t, i) {
+      var scopeNote = t.spansMultipleDays
+        ? '<span class="day-scope-note">(' + t.messages.length + ' message' + (t.messages.length === 1 ? '' : 's') + ' on this date)</span>'
+        : '';
+      return '<li data-jump-target="summary-' + t.threadId + '">' + (i + 1) + '. ' + escapeHtml(t.subject) + scopeNote + '</li>';
+    }).join('');
+
+    var summariesHtml = digest.threads.map(renderSummaryCard).join('');
+    var fullEmailsHtml = digest.threads.map(renderFullEmailCard).join('');
+
+    byId('main-content').innerHTML =
+      '<section class="digest-section" id="contents">' +
+        '<h2>Contents</h2>' +
+        '<ol id="contents-list">' + contentsHtml + '</ol>' +
+      '</section>' +
+      '<section class="digest-section" id="summaries">' +
+        '<h2>Summaries</h2>' +
+        summariesHtml +
+      '</section>' +
+      '<section class="digest-section" id="full-emails">' +
+        '<h2>Full emails</h2>' +
+        fullEmailsHtml +
+      '</section>';
+
+    wireContentsJumpLinks();
+    wireStatusIconButtons();
+    wireFullBodyButtons();
+  }
+
+  function participantsLine(t) {
+    if (t.messages.length <= 1) return '';
+    var names = [];
+    var seen = {};
+    t.messages.forEach(function (m) {
+      var name = (m.from.match(/^(.*)<[^>]+>\s*$/) || [null, m.from])[1].trim() || m.from;
+      if (!seen[name]) { seen[name] = true; names.push(name); }
+    });
+    var shown = names.slice(0, 2).join(', ');
+    var rest = names.length - 2;
+    var who = rest > 0 ? shown + ', +' + rest : shown;
+    return '<div class="card-participants">' + t.messages.length + ' messages · ' + escapeHtml(who) + '</div>';
+  }
+
+  function renderSummaryCard(t) {
+    var state = currentReadStarState[t.threadId] || { isRead: false, isStarred: false };
+    var scopeLabel = t.spansMultipleDays
+      ? '<div class="day-scoping-label">' + t.messages.length + ' message' + (t.messages.length === 1 ? '' : 's') + ' on this date</div>'
+      : '';
+
+    var bodyHtml;
+    if (t.summaryStatus === 'ok') {
+      bodyHtml = '<div class="summary-text">' + escapeHtml(t.summary) + '</div>';
+    } else if (t.summaryStatus === 'skipped-low-text') {
+      bodyHtml = '<div class="summary-status-note">Skipped — low text content / possibly image-heavy email.</div>';
+    } else if (t.summaryStatus === 'failed') {
+      bodyHtml = '<div class="summary-status-note failed">Summary failed: ' + escapeHtml(t.summaryError || 'unknown error') + '</div>';
+    } else {
+      bodyHtml = '<div class="summary-status-note">Summary pending.</div>';
+    }
+
+    return (
+      '<div class="card" id="summary-' + t.threadId + '" data-thread-id="' + t.threadId + '">' +
+        '<div class="card-header">' +
+          '<div>' +
+            '<div class="card-subject">' + escapeHtml(t.subject) + '</div>' +
+            participantsLine(t) +
+            '<div class="mono">Thread ID: ' + escapeHtml(t.threadId) + '</div>' +
+            scopeLabel +
+          '</div>' +
+          '<div class="status-icons">' +
+            '<button class="icon-btn read-toggle' + (state.isRead ? '' : ' active') + '" data-thread-id="' + t.threadId + '">' + (state.isRead ? 'Read' : '● Unread') + '</button>' +
+            '<button class="icon-btn star-toggle' + (state.isStarred ? ' active' : '') + '" data-thread-id="' + t.threadId + '">' + (state.isStarred ? '★ Starred' : '☆ Star') + '</button>' +
+          '</div>' +
+        '</div>' +
+        bodyHtml +
+        '<div style="margin-top:0.6rem;"><span class="jump-link" data-jump-target="full-' + t.threadId + '">Jump to full email →</span></div>' +
+      '</div>'
+    );
+  }
+
+  function renderFullEmailCard(t) {
+    var messagesHtml = t.messages.map(function (m) {
+      var truncatedNote = m.truncated
+        ? ' <button class="icon-btn load-full-body" data-message-id="' + m.messageId + '">Load full body</button>'
+        : '';
+      return (
+        '<div class="message-block" data-message-id="' + m.messageId + '">' +
+          '<div class="mono">' + escapeHtml(m.timestamp) + ' · Message ID: ' + escapeHtml(m.messageId) + '</div>' +
+          '<div>' + escapeHtml(m.from) + truncatedNote + '</div>' +
+          '<div class="message-body">' + escapeHtml(m.lowText ? '(Low text content / possibly image-heavy email)' : m.body) + '</div>' +
+        '</div>'
+      );
+    }).join('');
+
+    return (
+      '<div class="card" id="full-' + t.threadId + '">' +
+        '<div class="card-subject">' + escapeHtml(t.subject) + '</div>' +
+        '<div class="mono">Thread ID: ' + escapeHtml(t.threadId) + '</div>' +
+        '<div style="margin-top:0.5rem;"><span class="jump-link" data-jump-target="summary-' + t.threadId + '">↑ Back to summary</span></div>' +
+        messagesHtml +
+      '</div>'
+    );
+  }
+
+  function scrollToId(id) {
+    var el = byId(id);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function wireContentsJumpLinks() {
+    document.querySelectorAll('[data-jump-target]').forEach(function (el) {
+      el.addEventListener('click', function () { scrollToId(el.getAttribute('data-jump-target')); });
+    });
+  }
+
+  document.querySelectorAll('.jump-bar a').forEach(function (a) {
+    a.addEventListener('click', function () { scrollToId(a.getAttribute('data-jump')); });
+  });
+
+  // ---- Optimistic UI for read/star toggles ----
+  function threadMessageIds(threadId) {
+    var t = currentDigest.threads.find(function (t) { return t.threadId === threadId; });
+    return t ? t.messages.map(function (m) { return m.messageId; }) : [];
+  }
+
+  function setButtonState(threadId, kind, value) {
+    var card = document.querySelector('.card[data-thread-id="' + threadId + '"]');
+    if (!card) return;
+    if (kind === 'read') {
+      var btn = card.querySelector('.read-toggle');
+      btn.textContent = value ? 'Read' : '● Unread';
+      btn.classList.toggle('active', !value);
+    } else {
+      var sbtn = card.querySelector('.star-toggle');
+      sbtn.textContent = value ? '★ Starred' : '☆ Star';
+      sbtn.classList.toggle('active', value);
+    }
+    currentReadStarState[threadId] = currentReadStarState[threadId] || {};
+    currentReadStarState[threadId][kind === 'read' ? 'isRead' : 'isStarred'] = value;
+  }
+
+  function wireStatusIconButtons() {
+    document.querySelectorAll('.read-toggle').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var threadId = btn.getAttribute('data-thread-id');
+        var wasRead = currentReadStarState[threadId].isRead;
+        var newRead = !wasRead;
+        setButtonState(threadId, 'read', newRead); // optimistic
+        var ids = threadMessageIds(threadId);
+        var fn = newRead ? 'markThreadRead' : 'markThreadUnread';
+        google.script.run
+          .withFailureHandler(function (err) {
+            setButtonState(threadId, 'read', wasRead); // revert
+            alert('Gmail sync failed: ' + (err.message || err));
+          })
+          [fn](ids);
+      });
+    });
+
+    document.querySelectorAll('.star-toggle').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var threadId = btn.getAttribute('data-thread-id');
+        var wasStarred = currentReadStarState[threadId].isStarred;
+        var newStarred = !wasStarred;
+        setButtonState(threadId, 'star', newStarred); // optimistic
+        var ids = threadMessageIds(threadId);
+        var fn = newStarred ? 'starThread' : 'unstarThread';
+        google.script.run
+          .withFailureHandler(function (err) {
+            setButtonState(threadId, 'star', wasStarred); // revert
+            alert('Gmail sync failed: ' + (err.message || err));
+          })
+          [fn](ids);
+      });
+    });
+  }
+
+  function wireFullBodyButtons() {
+    document.querySelectorAll('.load-full-body').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var messageId = btn.getAttribute('data-message-id');
+        btn.disabled = true;
+        btn.textContent = 'Loading…';
+        google.script.run
+          .withSuccessHandler(function (fullBody) {
+            var block = document.querySelector('.message-block[data-message-id="' + messageId + '"] .message-body');
+            if (block) block.textContent = fullBody;
+            btn.remove();
+          })
+          .withFailureHandler(function (err) {
+            btn.disabled = false;
+            btn.textContent = 'Load full body (failed, retry)';
+            alert('Could not load full body: ' + (err.message || err));
+          })
+          .getFullMessageBody(messageId);
+      });
+    });
+  }
+
+  // ---- Mark all read (applies to every thread, including starred ones) ----
+  byId('mark-all-read-btn').addEventListener('click', function () {
+    if (!currentDigest) return;
+    var allIds = [];
+    currentDigest.threads.forEach(function (t) {
+      t.messages.forEach(function (m) { allIds.push(m.messageId); });
+      setButtonState(t.threadId, 'read', true); // optimistic, every thread including starred
+    });
+    google.script.run
+      .withFailureHandler(function (err) { alert('Mark all read failed: ' + (err.message || err)); })
+      .markAllRead(allIds);
+  });
+
+  // ---- Regenerate ----
+  byId('regenerate-btn').addEventListener('click', function () {
+    if (!currentDate) return;
+    var btn = byId('regenerate-btn');
+    btn.disabled = true;
+    btn.textContent = 'Regenerating…';
+    google.script.run
+      .withSuccessHandler(function (response) {
+        btn.disabled = false;
+        btn.textContent = 'Regenerate';
+        handleDigestResponse(response);
+      })
+      .withFailureHandler(function (err) {
+        btn.disabled = false;
+        btn.textContent = 'Regenerate';
+        alert('Regenerate failed: ' + (err.message || err));
+      })
+      .regenerateDigest(currentDate);
+  });
+
+  // ---- Back-to-top ----
+  window.addEventListener('scroll', function () {
+    byId('back-to-top').style.display = window.scrollY > 400 ? 'block' : 'none';
+  });
+  byId('back-to-top').addEventListener('click', function () {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+</script>
