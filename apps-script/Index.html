@@ -115,6 +115,16 @@
 
   main { max-width: 760px; margin: 0 auto; padding: 1.25rem; }
 
+  /* B2: long unbroken tokens (tracking URLs up to ~1,500 chars in real
+     bodies) inside pre-wrap text forced the page wider than the screen.
+     Let any text container break anywhere when it has to. */
+  .message-body, .summary-text, .card-subject, .card-participants, .mono,
+  .message-from, #contents-list li, .bulk-status {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .card-header > div:first-child { min-width: 0; flex: 1 1 14rem; }
+
   section.digest-section { margin-bottom: 2.5rem; }
 
   section.digest-section > h2 {
@@ -127,6 +137,7 @@
   #contents-list { padding-left: 1.2rem; }
   #contents-list li { margin-bottom: 0.35rem; cursor: pointer; }
   #contents-list li:hover { text-decoration: underline; }
+  #contents-list .contents-sender { color: #55564d; font-size: 0.9rem; }
   #contents-list .day-scope-note { color: var(--mustard); font-style: italic; font-size: 0.85rem; margin-left: 0.4rem; }
 
   .card {
@@ -148,7 +159,20 @@
   .card-subject { font-size: 1.05rem; font-weight: bold; }
   .card-participants { font-size: 0.85rem; color: #55564d; margin-top: 0.15rem; }
 
-  .status-icons { display: flex; gap: 0.5rem; align-items: center; white-space: nowrap; }
+  .status-icons { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; white-space: nowrap; }
+  /* B6: read state is a passive chip; the action is a separate labeled button. */
+  .state-chip {
+    display: inline-block;
+    font-size: 0.78rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: #55564d;
+    background: var(--bg);
+    cursor: default;
+    user-select: none;
+  }
+  .state-chip.unread { border-color: var(--mustard); color: #8a5d16; background: rgba(201, 138, 45, 0.12); font-weight: bold; }
   .icon-btn {
     border: 1px solid var(--border);
     background: var(--card-bg);
@@ -159,6 +183,11 @@
     font-family: inherit;
   }
   .icon-btn.active { background: var(--mustard); color: #fff; border-color: var(--mustard); }
+  .icon-btn:disabled { opacity: 0.6; cursor: default; }
+
+  .bulk-status { font-size: 0.9rem; color: #55564d; }
+  .bulk-status.ok { color: #2f6b3a; }
+  .bulk-status.error { color: #a63d3d; font-weight: bold; }
 
   .summary-text { margin-top: 0.6rem; white-space: pre-wrap; }
   .summary-status-note { margin-top: 0.6rem; font-style: italic; color: #8a6d1f; }
@@ -177,20 +206,32 @@
   .message-block:first-child { border-top: none; margin-top: 0; padding-top: 0; }
   .message-body { white-space: pre-wrap; margin-top: 0.4rem; }
 
+  /* B7: smaller, and kept inside a right-hand gutter so it never sits on text. */
   #back-to-top {
     position: fixed;
-    bottom: 1.5rem;
-    right: 1.5rem;
+    bottom: 1rem;
+    right: 1rem;
     border-radius: 50%;
-    width: 3rem;
-    height: 3rem;
+    width: 2.25rem;
+    height: 2.25rem;
+    padding: 0;
     background: var(--navy);
     color: #fff;
     border: none;
-    font-size: 1.2rem;
+    font-size: 1rem;
+    line-height: 2.25rem;
     cursor: pointer;
     display: none;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    opacity: 0.85;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+  }
+  #back-to-top:hover { opacity: 1; }
+
+  /* Below ~900px the centered column reaches the button's corner, so reserve
+     a right gutter wide enough for the button and pin it inside that gutter. */
+  @media (max-width: 900px) {
+    main { padding-right: 2.75rem; }
+    #back-to-top { width: 2rem; height: 2rem; line-height: 2rem; font-size: 0.9rem; right: 0.35rem; bottom: 0.75rem; }
   }
 
   .empty-state, .error-state {
@@ -203,6 +244,8 @@
   .loading-note { padding: 1.5rem; text-align: center; color: #55564d; }
 
   @media (max-width: 480px) {
+    main { padding-left: 0.9rem; }
+    .card { padding: 0.85rem 0.8rem; }
     .date-badge { position: static; display: inline-block; transform: rotate(-3deg); margin-top: 0.5rem; }
     header.page-header { padding-bottom: 0.5rem; }
   }
@@ -214,6 +257,7 @@
     <select id="date-select"></select>
     <button id="regenerate-btn" title="Re-run parsing + summarization for this date">Regenerate</button>
     <button id="mark-all-read-btn" class="primary">Mark all read</button>
+    <span class="bulk-status" id="bulk-status" role="status" aria-live="polite"></span>
   </div>
   <div class="date-badge" id="date-badge"></div>
 </header>
@@ -228,7 +272,7 @@
   <div class="loading-note" id="loading-note">Loading available dates…</div>
 </main>
 
-<button id="back-to-top" title="Back to top">↑</button>
+<button id="back-to-top" title="Back to top" aria-label="Back to top">↑</button>
 
 <script>
   var currentDigest = null;
@@ -265,8 +309,50 @@
     })
     .listAvailableDates();
 
+  // F1: display name only — drop "<email>", surrounding quotes, and a
+  // trailing " via X" / " (via X)" (Google Groups / list relays).
+  function senderDisplayName(from) {
+    var raw = String(from || '').trim();
+    var name = raw.replace(/\s*<[^>]*>\s*$/, '').trim();
+    name = name.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1').trim();
+    var noVia = name.replace(/\s*\(via\s+[^)]*\)\s*$/i, '').replace(/\s+via\s+\S.*$/i, '').trim();
+    if (noVia) name = noVia;
+    if (!name) {
+      var addr = raw.match(/<([^>]+)>/);
+      name = addr ? addr[1] : raw;
+    }
+    return name;
+  }
+
+  function contentsSender(t) {
+    var names = [];
+    var seen = {};
+    t.messages.forEach(function (m) {
+      var n = senderDisplayName(m.from);
+      var key = n.toLowerCase();
+      if (n && !seen[key]) { seen[key] = true; names.push(n); }
+    });
+    if (!names.length) return '';
+    return names[0] + (names.length > 1 ? ' +' + (names.length - 1) : '');
+  }
+
+  // B5: summaries can contain markdown bold (**Key messages**); strip the
+  // markers at display time only — stored digest data is untouched.
+  function displaySummary(s) {
+    return String(s == null ? '' : s).replace(/\*\*/g, '');
+  }
+
+  var bulkInFlight = false;
+
+  function setBulkStatus(text, kind) {
+    var el = byId('bulk-status');
+    el.textContent = text || '';
+    el.className = 'bulk-status' + (kind ? ' ' + kind : '');
+  }
+
   function loadDate(dateStr) {
     currentDate = dateStr;
+    if (!bulkInFlight) setBulkStatus('');
     byId('date-select').value = dateStr;
     byId('date-badge').textContent = dateStr;
     byId('jump-bar').style.display = 'none';
@@ -298,11 +384,14 @@
     var digest = currentDigest;
     byId('jump-bar').style.display = 'flex';
 
-    var contentsHtml = digest.threads.map(function (t, i) {
+    // B1: the <ol> supplies the number; no manual "(i + 1). " prefix.
+    var contentsHtml = digest.threads.map(function (t) {
       var scopeNote = t.spansMultipleDays
         ? '<span class="day-scope-note">(' + t.messages.length + ' message' + (t.messages.length === 1 ? '' : 's') + ' on this date)</span>'
         : '';
-      return '<li data-jump-target="summary-' + t.threadId + '">' + (i + 1) + '. ' + escapeHtml(t.subject) + scopeNote + '</li>';
+      var sender = contentsSender(t);
+      var senderHtml = sender ? ' <span class="contents-sender">— ' + escapeHtml(sender) + '</span>' : '';
+      return '<li data-jump-target="summary-' + t.threadId + '">' + escapeHtml(t.subject) + senderHtml + scopeNote + '</li>';
     }).join('');
 
     var summariesHtml = digest.threads.map(renderSummaryCard).join('');
@@ -349,7 +438,7 @@
 
     var bodyHtml;
     if (t.summaryStatus === 'ok') {
-      bodyHtml = '<div class="summary-text">' + escapeHtml(t.summary) + '</div>';
+      bodyHtml = '<div class="summary-text">' + escapeHtml(displaySummary(t.summary)) + '</div>';
     } else if (t.summaryStatus === 'skipped-low-text') {
       bodyHtml = '<div class="summary-status-note">Skipped — low text content / possibly image-heavy email.</div>';
     } else if (t.summaryStatus === 'failed') {
@@ -368,7 +457,8 @@
             scopeLabel +
           '</div>' +
           '<div class="status-icons">' +
-            '<button class="icon-btn read-toggle' + (state.isRead ? '' : ' active') + '" data-thread-id="' + t.threadId + '">' + (state.isRead ? 'Read' : '● Unread') + '</button>' +
+            '<span class="state-chip' + (state.isRead ? '' : ' unread') + '" aria-label="Status">' + (state.isRead ? 'Read' : '● Unread') + '</span>' +
+            '<button class="icon-btn read-action" data-thread-id="' + t.threadId + '">' + (state.isRead ? 'Mark unread' : 'Mark read') + '</button>' +
             '<button class="icon-btn star-toggle' + (state.isStarred ? ' active' : '') + '" data-thread-id="' + t.threadId + '">' + (state.isStarred ? '★ Starred' : '☆ Star') + '</button>' +
           '</div>' +
         '</div>' +
@@ -386,7 +476,7 @@
       return (
         '<div class="message-block" data-message-id="' + m.messageId + '">' +
           '<div class="mono">' + escapeHtml(m.timestamp) + ' · Message ID: ' + escapeHtml(m.messageId) + '</div>' +
-          '<div>' + escapeHtml(m.from) + truncatedNote + '</div>' +
+          '<div class="message-from">' + escapeHtml(m.from) + truncatedNote + '</div>' +
           '<div class="message-body">' + escapeHtml(m.lowText ? '(Low text content / possibly image-heavy email)' : m.body) + '</div>' +
         '</div>'
       );
@@ -427,9 +517,10 @@
     var card = document.querySelector('.card[data-thread-id="' + threadId + '"]');
     if (!card) return;
     if (kind === 'read') {
-      var btn = card.querySelector('.read-toggle');
-      btn.textContent = value ? 'Read' : '● Unread';
-      btn.classList.toggle('active', !value);
+      var chip = card.querySelector('.state-chip');
+      chip.textContent = value ? 'Read' : '● Unread';
+      chip.classList.toggle('unread', !value);
+      card.querySelector('.read-action').textContent = value ? 'Mark unread' : 'Mark read';
     } else {
       var sbtn = card.querySelector('.star-toggle');
       sbtn.textContent = value ? '★ Starred' : '☆ Star';
@@ -439,40 +530,48 @@
     currentReadStarState[threadId][kind === 'read' ? 'isRead' : 'isStarred'] = value;
   }
 
-  function wireStatusIconButtons() {
-    document.querySelectorAll('.read-toggle').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var threadId = btn.getAttribute('data-thread-id');
-        var wasRead = currentReadStarState[threadId].isRead;
-        var newRead = !wasRead;
-        setButtonState(threadId, 'read', newRead); // optimistic
-        var ids = threadMessageIds(threadId);
-        var fn = newRead ? 'markThreadRead' : 'markThreadUnread';
-        google.script.run
-          .withFailureHandler(function (err) {
-            setButtonState(threadId, 'read', wasRead); // revert
-            alert('Gmail sync failed: ' + (err.message || err));
-          })
-          [fn](ids);
-      });
-    });
+  // Server functions return {succeeded, failed} and only throw on a hard
+  // error, so a per-message failure arrives via the SUCCESS handler. Treat a
+  // non-empty `failed` list as a failure too.
+  function describeFailures(result) {
+    var failed = (result && result.failed) || [];
+    if (!failed.length) return '';
+    var first = failed[0];
+    return failed.length + ' message' + (failed.length === 1 ? '' : 's') + ' failed (' + (first.error || 'unknown error') + ')';
+  }
 
-    document.querySelectorAll('.star-toggle').forEach(function (btn) {
+  function wireToggle(selector, kind, stateKey, fnOn, fnOff) {
+    document.querySelectorAll(selector).forEach(function (btn) {
       btn.addEventListener('click', function () {
+        if (btn.disabled) return;
         var threadId = btn.getAttribute('data-thread-id');
-        var wasStarred = currentReadStarState[threadId].isStarred;
-        var newStarred = !wasStarred;
-        setButtonState(threadId, 'star', newStarred); // optimistic
+        var digestAtClick = currentDigest;
+        var was = !!(currentReadStarState[threadId] || {})[stateKey];
+        var next = !was;
+        setButtonState(threadId, kind, next); // optimistic
+        btn.disabled = true;
         var ids = threadMessageIds(threadId);
-        var fn = newStarred ? 'starThread' : 'unstarThread';
+        function revert(msg) {
+          btn.disabled = false;
+          if (currentDigest !== digestAtClick) return; // user switched dates
+          setButtonState(threadId, kind, was);
+          alert('Gmail sync failed: ' + msg);
+        }
         google.script.run
-          .withFailureHandler(function (err) {
-            setButtonState(threadId, 'star', wasStarred); // revert
-            alert('Gmail sync failed: ' + (err.message || err));
+          .withSuccessHandler(function (result) {
+            var problem = describeFailures(result);
+            if (problem) { revert(problem); return; }
+            btn.disabled = false;
           })
-          [fn](ids);
+          .withFailureHandler(function (err) { revert((err && err.message) || err); })
+          [next ? fnOn : fnOff](ids);
       });
     });
+  }
+
+  function wireStatusIconButtons() {
+    wireToggle('.read-action', 'read', 'isRead', 'markThreadRead', 'markThreadUnread');
+    wireToggle('.star-toggle', 'star', 'isStarred', 'starThread', 'unstarThread');
   }
 
   function wireFullBodyButtons() {
@@ -498,15 +597,58 @@
   }
 
   // ---- Mark all read (applies to every thread, including starred ones) ----
+  // F2: progress while running, then an explicit success or a clear error.
   byId('mark-all-read-btn').addEventListener('click', function () {
-    if (!currentDigest) return;
+    if (!currentDigest || bulkInFlight) return;
+    var btn = byId('mark-all-read-btn');
+    var digestAtClick = currentDigest;
+    var threads = digestAtClick.threads;
+    var n = threads.length;
+    var label = n + ' thread' + (n === 1 ? '' : 's');
     var allIds = [];
-    currentDigest.threads.forEach(function (t) {
-      t.messages.forEach(function (m) { allIds.push(m.messageId); });
+    var priorRead = {};
+    var threadOfMessage = {};
+    threads.forEach(function (t) {
+      priorRead[t.threadId] = !!(currentReadStarState[t.threadId] || {}).isRead;
+      t.messages.forEach(function (m) { allIds.push(m.messageId); threadOfMessage[m.messageId] = t; });
       setButtonState(t.threadId, 'read', true); // optimistic, every thread including starred
     });
+
+    bulkInFlight = true;
+    btn.disabled = true;
+    setBulkStatus('Marking ' + label + ' read…');
+
+    function finish() { bulkInFlight = false; btn.disabled = false; }
+    function revertThreads(list) {
+      if (currentDigest !== digestAtClick) return;
+      list.forEach(function (t) { setButtonState(t.threadId, 'read', priorRead[t.threadId]); });
+    }
+
     google.script.run
-      .withFailureHandler(function (err) { alert('Mark all read failed: ' + (err.message || err)); })
+      .withSuccessHandler(function (result) {
+        finish();
+        var failed = (result && result.failed) || [];
+        if (!failed.length) {
+          setBulkStatus('Done: ' + label + ' marked read', 'ok');
+          return;
+        }
+        var badThreads = [];
+        var seen = {};
+        failed.forEach(function (f) {
+          var t = threadOfMessage[f.messageId];
+          if (t && !seen[t.threadId]) { seen[t.threadId] = true; badThreads.push(t); }
+        });
+        revertThreads(badThreads);
+        var names = badThreads.slice(0, 3).map(function (t) { return '"' + t.subject + '"'; }).join(', ');
+        if (badThreads.length > 3) names += ' and ' + (badThreads.length - 3) + ' more';
+        setBulkStatus('Error: ' + badThreads.length + ' of ' + label + ' could not be marked read — ' +
+          names + ' (' + (failed[0].error || 'unknown error') + ')', 'error');
+      })
+      .withFailureHandler(function (err) {
+        finish();
+        revertThreads(threads);
+        setBulkStatus('Error: Mark all read failed — ' + String((err && err.message) || err).replace(/\.+$/, '') + '. Read states were restored on this page; reload to see what Gmail actually has.', 'error');
+      })
       .markAllRead(allIds);
   });
 
