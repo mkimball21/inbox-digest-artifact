@@ -118,8 +118,8 @@
   /* B2: long unbroken tokens (tracking URLs up to ~1,500 chars in real
      bodies) inside pre-wrap text forced the page wider than the screen.
      Let any text container break anywhere when it has to. */
-  .message-body, .summary-text, .card-subject, .card-participants, .mono,
-  .message-from, #contents-list li, .bulk-status {
+  .message-body, .summary-text, .card-subject, .card-meta, .mono,
+  .message-from, .raw-from, #contents-list li, .bulk-status {
     overflow-wrap: anywhere;
     word-break: break-word;
   }
@@ -138,6 +138,12 @@
   #contents-list li { margin-bottom: 0.35rem; cursor: pointer; }
   #contents-list li:hover { text-decoration: underline; }
   #contents-list .contents-sender { color: #55564d; font-size: 0.9rem; }
+  #contents-list .contents-time { color: #55564d; font-size: 0.82rem; font-family: 'Courier New', Courier, monospace; margin-left: 0.1rem; }
+
+  /* Round 2 #6: jump targets land fully below the sticky navy bar. */
+  section.digest-section, .card { scroll-margin-top: 3.4rem; }
+
+  .digest-counts { margin: -0.35rem 0 0.75rem; font-size: 0.9rem; color: #55564d; font-style: italic; }
   #contents-list .day-scope-note { color: var(--mustard); font-style: italic; font-size: 0.85rem; margin-left: 0.4rem; }
 
   .card {
@@ -157,7 +163,13 @@
   }
 
   .card-subject { font-size: 1.05rem; font-weight: bold; }
-  .card-participants { font-size: 0.85rem; color: #55564d; margin-top: 0.15rem; }
+  .card-meta { font-size: 0.88rem; color: #3d3e37; margin-top: 0.2rem; }
+  .card-meta .meta-label { color: #77786e; }
+  .item-num { color: var(--navy); }
+
+  .message-from .sender-name { font-weight: bold; }
+  .message-from .msg-time { font-family: 'Courier New', Courier, monospace; font-size: 0.82rem; color: #55564d; margin-left: 0.4rem; }
+  .raw-from { font-size: 0.78rem; color: #77786e; }
 
   .status-icons { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; white-space: nowrap; }
   /* B6: read state is a passive chip; the action is a separate labeled button. */
@@ -253,6 +265,7 @@
 
 <header class="page-header">
   <h1>Inbox Digest</h1>
+  <div class="digest-counts" id="digest-counts"></div>
   <div class="controls-row">
     <select id="date-select"></select>
     <button id="regenerate-btn" title="Re-run parsing + summarization for this date">Regenerate</button>
@@ -324,6 +337,19 @@
     return name;
   }
 
+  // "2026-11-07 07:22:41" -> "07:22". Falls back to the raw value.
+  function timeOf(ts) {
+    var m = String(ts == null ? '' : ts).match(/(\d{1,2}:\d{2})(?::\d{2})?/);
+    return m ? m[1] : String(ts == null ? '' : ts);
+  }
+
+  // Earliest / latest timestamp in a thread. The server's format
+  // (YYYY-MM-DD HH:MM:SS) sorts correctly as a string.
+  function threadTimeRange(t) {
+    var ts = t.messages.map(function (m) { return String(m.timestamp || ''); }).filter(Boolean).sort();
+    return { first: ts[0] || '', last: ts[ts.length - 1] || '' };
+  }
+
   function contentsSender(t) {
     var names = [];
     var seen = {};
@@ -352,6 +378,7 @@
 
   function loadDate(dateStr) {
     currentDate = dateStr;
+    byId('digest-counts').textContent = '';
     if (!bulkInFlight) setBulkStatus('');
     byId('date-select').value = dateStr;
     byId('date-badge').textContent = dateStr;
@@ -377,7 +404,19 @@
     }
     currentDigest = response.digest;
     currentReadStarState = response.readStarState;
+    renderCounts(currentDigest);
     renderDigest();
+  }
+
+  // Round 2 #1: "N emails across M threads", from the digest's own totals
+  // (falls back to counting only if an older digest lacks the fields).
+  function renderCounts(digest) {
+    var threads = digest.threads || [];
+    var nEmails = typeof digest.totalEmails === 'number' ? digest.totalEmails
+      : threads.reduce(function (a, t) { return a + t.messages.length; }, 0);
+    var nThreads = typeof digest.totalThreads === 'number' ? digest.totalThreads : threads.length;
+    byId('digest-counts').textContent = nEmails + ' email' + (nEmails === 1 ? '' : 's') +
+      ' across ' + nThreads + ' thread' + (nThreads === 1 ? '' : 's');
   }
 
   function renderDigest() {
@@ -391,7 +430,9 @@
         : '';
       var sender = contentsSender(t);
       var senderHtml = sender ? ' <span class="contents-sender">— ' + escapeHtml(sender) + '</span>' : '';
-      return '<li data-jump-target="summary-' + t.threadId + '">' + escapeHtml(t.subject) + senderHtml + scopeNote + '</li>';
+      var first = threadTimeRange(t).first;
+      var timeHtml = first ? ' <span class="contents-time">' + escapeHtml(timeOf(first)) + '</span>' : '';
+      return '<li data-jump-target="summary-' + t.threadId + '">' + escapeHtml(t.subject) + senderHtml + timeHtml + scopeNote + '</li>';
     }).join('');
 
     var summariesHtml = digest.threads.map(renderSummaryCard).join('');
@@ -416,21 +457,34 @@
     wireFullBodyButtons();
   }
 
-  function participantsLine(t) {
-    if (t.messages.length <= 1) return '';
-    var names = [];
-    var seen = {};
-    t.messages.forEach(function (m) {
-      var name = (m.from.match(/^(.*)<[^>]+>\s*$/) || [null, m.from])[1].trim() || m.from;
-      if (!seen[name]) { seen[name] = true; names.push(name); }
-    });
-    var shown = names.slice(0, 2).join(', ');
-    var rest = names.length - 2;
-    var who = rest > 0 ? shown + ', +' + rest : shown;
-    return '<div class="card-participants">' + t.messages.length + ' messages · ' + escapeHtml(who) + '</div>';
+  // Round 2 #3: labeled From / Received lines; replaces participantsLine().
+  // Uses the same contentsSender()/senderDisplayName() as Contents so the
+  // names match exactly.
+  function metaLines(t) {
+    var sender = contentsSender(t);
+    var range = threadTimeRange(t);
+    var n = t.messages.length;
+    var received = '';
+    if (range.first) {
+      received = timeOf(range.first);
+      if (n > 1) {
+        var last = timeOf(range.last);
+        if (last !== received) received += ' to ' + last;
+        received += ' (' + n + ' messages)';
+      }
+    }
+    return (
+      (sender ? '<div class="card-meta"><span class="meta-label">From:</span> <span class="meta-from">' + escapeHtml(sender) + '</span></div>' : '') +
+      (received ? '<div class="card-meta"><span class="meta-label">Received:</span> <span class="meta-received">' + escapeHtml(received) + '</span></div>' : '')
+    );
   }
 
-  function renderSummaryCard(t) {
+  // Round 2 #5: same item number as Contents' <ol>.
+  function numberedSubject(t, i) {
+    return '<span class="item-num">' + (i + 1) + '.</span> ' + escapeHtml(t.subject);
+  }
+
+  function renderSummaryCard(t, i) {
     var state = currentReadStarState[t.threadId] || { isRead: false, isStarred: false };
     var scopeLabel = t.spansMultipleDays
       ? '<div class="day-scoping-label">' + t.messages.length + ' message' + (t.messages.length === 1 ? '' : 's') + ' on this date</div>'
@@ -451,8 +505,8 @@
       '<div class="card" id="summary-' + t.threadId + '" data-thread-id="' + t.threadId + '">' +
         '<div class="card-header">' +
           '<div>' +
-            '<div class="card-subject">' + escapeHtml(t.subject) + '</div>' +
-            participantsLine(t) +
+            '<div class="card-subject">' + numberedSubject(t, i) + '</div>' +
+            metaLines(t) +
             '<div class="mono">Thread ID: ' + escapeHtml(t.threadId) + '</div>' +
             scopeLabel +
           '</div>' +
@@ -468,7 +522,7 @@
     );
   }
 
-  function renderFullEmailCard(t) {
+  function renderFullEmailCard(t, i) {
     var messagesHtml = t.messages.map(function (m) {
       var truncatedNote = m.truncated
         ? ' <button class="icon-btn load-full-body" data-message-id="' + m.messageId + '">Load full body</button>'
@@ -476,7 +530,9 @@
       return (
         '<div class="message-block" data-message-id="' + m.messageId + '">' +
           '<div class="mono">' + escapeHtml(m.timestamp) + ' · Message ID: ' + escapeHtml(m.messageId) + '</div>' +
-          '<div class="message-from">' + escapeHtml(m.from) + truncatedNote + '</div>' +
+          '<div class="message-from"><span class="sender-name">' + escapeHtml(senderDisplayName(m.from)) + '</span>' +
+            '<span class="msg-time">' + escapeHtml(timeOf(m.timestamp)) + '</span>' + truncatedNote + '</div>' +
+          '<div class="raw-from">' + escapeHtml(m.from) + '</div>' +
           '<div class="message-body">' + escapeHtml(m.lowText ? '(Low text content / possibly image-heavy email)' : m.body) + '</div>' +
         '</div>'
       );
@@ -484,7 +540,7 @@
 
     return (
       '<div class="card" id="full-' + t.threadId + '">' +
-        '<div class="card-subject">' + escapeHtml(t.subject) + '</div>' +
+        '<div class="card-subject">' + numberedSubject(t, i) + '</div>' +
         '<div class="mono">Thread ID: ' + escapeHtml(t.threadId) + '</div>' +
         '<div style="margin-top:0.5rem;"><span class="jump-link" data-jump-target="summary-' + t.threadId + '">↑ Back to summary</span></div>' +
         messagesHtml +
