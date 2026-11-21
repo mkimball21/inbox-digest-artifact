@@ -20,3 +20,10 @@ No server (.gs) changes; every google.script.run name and argument is unchanged.
 - **#4 Full-email sender** — before: raw "Name <email>" only. After: the clean name in bold with HH:MM, and the raw "Name <email>" kept below it, small and muted.
 - **#5 Item numbers** — before: summary and full-email titles had no number. After: "7. Subject" in both, matching the Contents `<ol>`. Contents still shows one number per item.
 - **#6 Jump targets** — before: jumps landed under the sticky navy bar. After: `scroll-margin-top` puts the card or section heading about 15px below the bar.
+
+# Polish round 3 — apps-script/Index.html only
+
+No server (.gs) changes; every google.script.run name and argument is unchanged.
+
+- **Open in Gmail** — before: no link to the original email. After: a small "Open in Gmail ↗" link on every message's sender line in Full emails, and on every summary card, which opens the thread's latest message. The link is `https://mail.google.com/mail/?authuser=mkimball1021@gmail.com#all/thread-f:<thread ID as decimal>|msg-f:<message ID as decimal>`, converted from hex with BigInt. It opens in a new tab (`target="_blank" rel="noopener"`) and never toggles, scrolls or calls the server. It is hidden when an ID isn't valid hex.
+- **Mark all read confirmation** — before: it ran immediately. After: an inline "Mark N threads read? Yes / Cancel" appears first, with no browser dialog. Cancel sends nothing, and switching dates closes an open confirm. Starred threads are still marked read.

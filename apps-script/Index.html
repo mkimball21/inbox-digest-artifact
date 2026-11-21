@@ -171,6 +171,17 @@
   .message-from .msg-time { font-family: 'Courier New', Courier, monospace; font-size: 0.82rem; color: #55564d; margin-left: 0.4rem; }
   .raw-from { font-size: 0.78rem; color: #77786e; }
 
+  /* Round 3: Open in Gmail */
+  .gmail-link { font-size: 0.8rem; color: var(--navy); white-space: nowrap; margin-left: 0.5rem; }
+  .gmail-link:hover { text-decoration: none; }
+  .card-links { margin-top: 0.6rem; display: flex; flex-wrap: wrap; gap: 0.3rem 0.75rem; align-items: baseline; }
+  .card-links .gmail-link { margin-left: 0; }
+
+  /* Round 3: inline Mark-all-read confirmation (no browser dialogs) */
+  .bulk-confirm { display: inline-flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; font-size: 0.92rem; }
+  .bulk-confirm[hidden] { display: none; }
+  .bulk-confirm button { padding: 0.25rem 0.7rem; font-size: 0.88rem; }
+
   .status-icons { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; white-space: nowrap; }
   /* B6: read state is a passive chip; the action is a separate labeled button. */
   .state-chip {
@@ -270,6 +281,11 @@
     <select id="date-select"></select>
     <button id="regenerate-btn" title="Re-run parsing + summarization for this date">Regenerate</button>
     <button id="mark-all-read-btn" class="primary">Mark all read</button>
+    <span class="bulk-confirm" id="bulk-confirm" role="group" aria-label="Confirm mark all read" hidden>
+      <span id="bulk-confirm-text"></span>
+      <button id="bulk-confirm-yes" class="primary">Yes</button>
+      <button id="bulk-confirm-cancel">Cancel</button>
+    </span>
     <span class="bulk-status" id="bulk-status" role="status" aria-live="polite"></span>
   </div>
   <div class="date-badge" id="date-badge"></div>
@@ -350,6 +366,38 @@
     return { first: ts[0] || '', last: ts[ts.length - 1] || '' };
   }
 
+  // Round 3: "Open in Gmail" deep link. Gmail's own viewUrl uses decimal
+  // forms of the hex IDs: #all/thread-f:<DEC>|msg-f:<DEC>. thread-f is the
+  // thread ID (equal to the first message's ID in a fresh thread; it differs
+  // when earlier messages fall on other days), msg-f is the message's own ID.
+  // Returns '' (link hidden) when an ID is not valid hex.
+  var GMAIL_ACCOUNT = 'mkimball1021@gmail.com';
+  var HEX_ID = /^[0-9a-f]{1,16}$/i;
+  function hexToDec(hex) {
+    if (!HEX_ID.test(String(hex || '')) || typeof BigInt !== 'function') return '';
+    try { return BigInt('0x' + hex).toString(); } catch (e) { return ''; }
+  }
+  function gmailUrl(threadId, messageId) {
+    var msgDec = hexToDec(messageId);
+    if (!msgDec) return '';
+    var threadDec = hexToDec(threadId) || msgDec;
+    return 'https://mail.google.com/mail/?authuser=' + GMAIL_ACCOUNT +
+      '#all/thread-f:' + threadDec + '|msg-f:' + msgDec;
+  }
+  function gmailLinkHtml(threadId, messageId) {
+    var url = gmailUrl(threadId, messageId);
+    if (!url) return '';
+    return '<a class="gmail-link" href="' + escapeHtml(url) + '" target="_blank" rel="noopener"' +
+      ' title="Open this message in Gmail (new tab)">Open in Gmail ↗</a>';
+  }
+  function latestMessage(t) {
+    var latest = null;
+    t.messages.forEach(function (m) {
+      if (!latest || String(m.timestamp || '') >= String(latest.timestamp || '')) latest = m;
+    });
+    return latest;
+  }
+
   function contentsSender(t) {
     var names = [];
     var seen = {};
@@ -380,6 +428,7 @@
     currentDate = dateStr;
     byId('digest-counts').textContent = '';
     if (!bulkInFlight) setBulkStatus('');
+    hideBulkConfirm();
     byId('date-select').value = dateStr;
     byId('date-badge').textContent = dateStr;
     byId('jump-bar').style.display = 'none';
@@ -517,7 +566,8 @@
           '</div>' +
         '</div>' +
         bodyHtml +
-        '<div style="margin-top:0.6rem;"><span class="jump-link" data-jump-target="full-' + t.threadId + '">Jump to full email →</span></div>' +
+        '<div class="card-links"><span class="jump-link" data-jump-target="full-' + t.threadId + '">Jump to full email →</span>' +
+          (latestMessage(t) ? gmailLinkHtml(t.threadId, latestMessage(t).messageId) : '') + '</div>' +
       '</div>'
     );
   }
@@ -531,7 +581,8 @@
         '<div class="message-block" data-message-id="' + m.messageId + '">' +
           '<div class="mono">' + escapeHtml(m.timestamp) + ' · Message ID: ' + escapeHtml(m.messageId) + '</div>' +
           '<div class="message-from"><span class="sender-name">' + escapeHtml(senderDisplayName(m.from)) + '</span>' +
-            '<span class="msg-time">' + escapeHtml(timeOf(m.timestamp)) + '</span>' + truncatedNote + '</div>' +
+            '<span class="msg-time">' + escapeHtml(timeOf(m.timestamp)) + '</span>' +
+            gmailLinkHtml(t.threadId, m.messageId) + truncatedNote + '</div>' +
           '<div class="raw-from">' + escapeHtml(m.from) + '</div>' +
           '<div class="message-body">' + escapeHtml(m.lowText ? '(Low text content / possibly image-heavy email)' : m.body) + '</div>' +
         '</div>'
@@ -558,6 +609,12 @@
       el.addEventListener('click', function () { scrollToId(el.getAttribute('data-jump-target')); });
     });
   }
+
+  // Gmail links only open a new tab: never let the click reach any other
+  // handler (read/star toggles, jump links, anything added later).
+  document.addEventListener('click', function (e) {
+    if (e.target && e.target.closest && e.target.closest('a.gmail-link')) e.stopPropagation();
+  }, true);
 
   document.querySelectorAll('.jump-bar a').forEach(function (a) {
     a.addEventListener('click', function () { scrollToId(a.getAttribute('data-jump')); });
@@ -653,8 +710,28 @@
   }
 
   // ---- Mark all read (applies to every thread, including starred ones) ----
-  // F2: progress while running, then an explicit success or a clear error.
+  // Round 3: inline "Mark N threads read? Yes / Cancel" first (no confirm()).
+  function hideBulkConfirm() {
+    byId('bulk-confirm').hidden = true;
+    if (!bulkInFlight) byId('mark-all-read-btn').disabled = false;
+  }
   byId('mark-all-read-btn').addEventListener('click', function () {
+    if (!currentDigest || bulkInFlight) return;
+    var n = currentDigest.threads.length;
+    setBulkStatus('');
+    byId('bulk-confirm-text').textContent = 'Mark ' + n + ' thread' + (n === 1 ? '' : 's') + ' read?';
+    byId('bulk-confirm').hidden = false;
+    byId('mark-all-read-btn').disabled = true;
+    byId('bulk-confirm-yes').focus();
+  });
+  byId('bulk-confirm-cancel').addEventListener('click', hideBulkConfirm);
+  byId('bulk-confirm-yes').addEventListener('click', function () {
+    hideBulkConfirm();
+    runMarkAllRead();
+  });
+
+  // F2: progress while running, then an explicit success or a clear error.
+  function runMarkAllRead() {
     if (!currentDigest || bulkInFlight) return;
     var btn = byId('mark-all-read-btn');
     var digestAtClick = currentDigest;
@@ -706,7 +783,7 @@
         setBulkStatus('Error: Mark all read failed — ' + String((err && err.message) || err).replace(/\.+$/, '') + '. Read states were restored on this page; reload to see what Gmail actually has.', 'error');
       })
       .markAllRead(allIds);
-  });
+  }
 
   // ---- Regenerate ----
   byId('regenerate-btn').addEventListener('click', function () {
